@@ -26,6 +26,7 @@ class MainWindow(QMainWindow):
         self.history       = []     # list of img_current copies for undo
         self.image_list    = []     # flat list of image paths (arrow navigation)
         self.current_index = -1
+        self._brush_blurred_ref = None  # precomputed blur reference for brush strokes
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -76,6 +77,10 @@ class MainWindow(QMainWindow):
         self.image_panel.lb_image.roi_rect_selected.connect(self.apply_blur_rect)
         self.image_panel.lb_image.roi_circle_selected.connect(self.apply_blur_circle)
         self.image_panel.lb_image.roi_polygon_selected.connect(self.apply_blur_polygon)
+        self.image_panel.lb_image.brush_stroke.connect(self.apply_blur_brush)
+
+        # Keep brush cursor size in sync with the slider
+        self.tools_panel.slider_brush_size.valueChanged.connect(self._sync_brush_radius)
 
         self.dir_panel.file_selected.connect(self.load_image_from_path)
 
@@ -174,6 +179,12 @@ class MainWindow(QMainWindow):
     def _on_roi_mode_changed(self, mode: str):
         """Activate the selected ROI drawing mode on the image panel."""
         self.image_panel.set_draw_mode(mode if mode != 'none' else None)
+        self._sync_brush_radius()
+
+
+    def _sync_brush_radius(self):
+        """Copy the current brush-size slider value to InteractiveLabel."""
+        self.image_panel.lb_image._brush_radius = self.tools_panel.get_brush_size()
 
 
     def undo_action(self):
@@ -276,6 +287,41 @@ class MainWindow(QMainWindow):
         mask = np.zeros((real_h, real_w), dtype=np.uint8)
         cv2.fillPoly(mask, [real_pts], 255)
         self._apply_mask_blur(mask)
+
+
+    def apply_blur_brush(self, x: int, y: int, is_first_point: bool):
+        """Apply blur under the brush cursor at position (x, y).
+
+        is_first_point=True  → save history and precompute a blurred reference
+                               image once for the entire stroke.
+        is_first_point=False → copy pixels from the precomputed reference—
+                               no repeated full-image GaussianBlur calls.
+        """
+        if self.img_current is None:
+            return
+
+        ratio_x, ratio_y = self._get_pixel_ratios()
+        if ratio_x is None:
+            return
+
+        if is_first_point:
+            self.history.append(self.img_current.copy())
+            kernel = self.tools_panel.get_blur_kernel()
+            self._brush_blurred_ref = cv2.GaussianBlur(self.img_current, (kernel, kernel), 0)
+
+        if self._brush_blurred_ref is None:
+            return
+
+        brush_display_r = self.tools_panel.get_brush_size()
+        real_h, real_w  = self.img_current.shape[:2]
+        real_cx = int(x * ratio_x)
+        real_cy = int(y * ratio_y)
+        real_r  = max(1, int(brush_display_r * (ratio_x + ratio_y) / 2))
+
+        mask = np.zeros((real_h, real_w), dtype=np.uint8)
+        cv2.circle(mask, (real_cx, real_cy), real_r, 255, -1)
+        self.img_current[mask == 255] = self._brush_blurred_ref[mask == 255]
+        self.image_panel.refresh()
 
 
     def save_image(self):

@@ -32,7 +32,7 @@ class ToolsPanel(QWidget):
 
     grayscale_requested = Signal()
     active_tool_changed = Signal(str)   # 'grayscale' | 'blur' | 'none'
-    roi_mode_changed    = Signal(str)   # 'rectangle' | 'circle' | 'polygon' | 'none'
+    roi_mode_changed    = Signal(str)   # 'rectangle' | 'circle' | 'polygon' | 'brush' | 'none'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -84,11 +84,17 @@ class ToolsPanel(QWidget):
         ly_blur = QVBoxLayout(self._page_blur)
         ly_blur.setSpacing(6)
 
-        ly_blur.addWidget(QLabel('Brush size:'))
+        ly_blur.addWidget(QLabel('Blur strength:'))
         self.slider_blur = QSlider(Qt.Horizontal)
-        self.slider_blur.setRange(1, 30)
-        self.slider_blur.setValue(5)
+        self.slider_blur.setRange(1, 50)
+        self.slider_blur.setValue(10)
         ly_blur.addWidget(self.slider_blur)
+
+        ly_blur.addWidget(QLabel('Brush size:'))
+        self.slider_brush_size = QSlider(Qt.Horizontal)
+        self.slider_brush_size.setRange(5, 100)
+        self.slider_brush_size.setValue(20)
+        ly_blur.addWidget(self.slider_brush_size)
 
         # ROI shape selection buttons
         ly_blur.addWidget(QLabel('ROI shape:'))
@@ -116,6 +122,13 @@ class ToolsPanel(QWidget):
         self.btn_roi_polygon.setStyleSheet(_BTN_STYLE)
         ly_roi.addWidget(self.btn_roi_polygon)
 
+        self.btn_roi_brush = QPushButton()
+        self.btn_roi_brush.setIcon(QIcon('assets/brush.png'))
+        self.btn_roi_brush.setToolTip('Brush ROI  (hold LMB and drag to paint blur)')
+        self.btn_roi_brush.setCheckable(True)
+        self.btn_roi_brush.setStyleSheet(_BTN_STYLE)
+        ly_roi.addWidget(self.btn_roi_brush)
+
         ly_roi.addStretch()
         ly_blur.addLayout(ly_roi)
         ly_blur.addStretch()
@@ -134,6 +147,8 @@ class ToolsPanel(QWidget):
             lambda: self._on_roi_clicked(self.btn_roi_circle, 'circle'))
         self.btn_roi_polygon.clicked.connect(
             lambda: self._on_roi_clicked(self.btn_roi_polygon, 'polygon'))
+        self.btn_roi_brush.clicked.connect(
+            lambda: self._on_roi_clicked(self.btn_roi_brush, 'brush'))
 
 
     def _on_tool_clicked(self, clicked_btn: QPushButton, tool_name: str):
@@ -161,7 +176,7 @@ class ToolsPanel(QWidget):
         """Handle a ROI button click (checkable toggle with mutual exclusion)."""
         is_now_checked = clicked_btn.isChecked()   
 
-        for btn in (self.btn_roi_rect, self.btn_roi_circle, self.btn_roi_polygon):
+        for btn in (self.btn_roi_rect, self.btn_roi_circle, self.btn_roi_polygon, self.btn_roi_brush):
             if btn is not clicked_btn:
                 btn.setChecked(False)
 
@@ -170,7 +185,7 @@ class ToolsPanel(QWidget):
 
     def _deactivate_roi_buttons(self):
         """Uncheck all ROI buttons and notify that no ROI mode is active."""
-        for btn in (self.btn_roi_rect, self.btn_roi_circle, self.btn_roi_polygon):
+        for btn in (self.btn_roi_rect, self.btn_roi_circle, self.btn_roi_polygon, self.btn_roi_brush):
             btn.setChecked(False)
         self.roi_mode_changed.emit('none')
 
@@ -178,3 +193,7 @@ class ToolsPanel(QWidget):
     def get_blur_kernel(self):
         """Return current blur kernel size (always an odd number)."""
         return self.slider_blur.value() * 2 + 1
+
+    def get_brush_size(self):
+        """Return current brush radius in display pixels."""
+        return self.slider_brush_size.value()
