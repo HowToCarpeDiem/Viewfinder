@@ -50,8 +50,14 @@ class InteractiveLabel(QLabel):
         self._brush_radius    = 20      
         self._brush_last_emit = None    
 
+        # Committed (persisted) ROI — normalised to [0, 1] of the pixmap size
+        # so the outline stays correct after zoom changes.
+        self._committed_roi_norm = None
+
         # RMB panning state
-        self._pan_last = QPoint()
+        self._pan_last         = QPoint()
+        self._pan_press_global = QPoint()  # global pos at the moment of RMB press
+        self._pan_did_drag     = False     # True once the pointer moves beyond the click threshold
 
 
     def set_draw_mode(self, mode):
@@ -80,8 +86,11 @@ class InteractiveLabel(QLabel):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.RightButton:
-            self._pan_last = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
+            g = event.globalPosition().toPoint()
+            self._pan_press_global = g
+            self._pan_last         = g
+            self._pan_did_drag     = False
+            # Cursor stays as-is until the drag threshold is crossed
             return
 
         if event.button() != Qt.LeftButton or self.draw_mode is None:
@@ -113,9 +122,20 @@ class InteractiveLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.RightButton:
-            delta = event.pos() - self._pan_last
-            self._pan_last = event.pos()
-            self.pan_delta.emit(delta.x(), delta.y())
+            current = event.globalPosition().toPoint()
+            if not self._pan_did_drag:
+                # Check whether the pointer has moved far enough to count as a drag
+                diff = current - self._pan_press_global
+                if abs(diff.x()) > 5 or abs(diff.y()) > 5:
+                    self._pan_did_drag = True
+                    self._pan_last = current   # anchor to avoid a jump on first pan delta
+                    self.setCursor(Qt.ClosedHandCursor)
+            if self._pan_did_drag:
+                # Use global coords — local coords shift when the scroll area scrolls,
+                # which would corrupt the delta and cause visible jitter.
+                delta = current - self._pan_last
+                self._pan_last = current
+                self.pan_delta.emit(delta.x(), delta.y())
             return
 
         if self.draw_mode == 'rectangle' and self.is_drawing:
@@ -152,6 +172,14 @@ class InteractiveLabel(QLabel):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.RightButton:
             self.setCursor(Qt.CrossCursor if self.draw_mode == 'brush' else Qt.ArrowCursor)
+            if not self._pan_did_drag and self.draw_mode == 'polygon' and self._polygon_points:
+                # RMB click (no drag) while drawing a polygon — close it
+                if len(self._polygon_points) >= 3:
+                    points = [(p.x(), p.y()) for p in self._polygon_points]
+                    self.roi_polygon_selected.emit(points)
+                self._polygon_points.clear()
+                self._cursor_pos = None
+                self.update()
             return
 
         if event.button() != Qt.LeftButton:
@@ -186,22 +214,6 @@ class InteractiveLabel(QLabel):
             self.update()
 
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() != Qt.LeftButton or self.draw_mode != 'polygon':
-            return
-
-        if self._polygon_points:
-            self._polygon_points.pop()
-
-        if len(self._polygon_points) >= 3:
-            points = [(p.x(), p.y()) for p in self._polygon_points]
-            self.roi_polygon_selected.emit(points)
-
-        self._polygon_points.clear()
-        self._cursor_pos = None
-        self.update()
-
-
     def keyPressEvent(self, event):
         """Esc cancels an in-progress polygon."""
         if event.key() == Qt.Key_Escape and self.draw_mode == 'polygon':
@@ -214,11 +226,13 @@ class InteractiveLabel(QLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if self.draw_mode is None:
-            return
 
         painter = QPainter(self)
 
+        # Always draw the committed selection outline (visible regardless of draw mode)
+        self._paint_committed_roi(painter)
+
+        # Draw the in-progress shape (only when a draw mode is active)
         if self.draw_mode == 'rectangle':
             self._paint_rectangle(painter)
         elif self.draw_mode == 'circle':
@@ -285,6 +299,107 @@ class InteractiveLabel(QLabel):
         painter.setPen(QPen(QColor(255, 255, 255, 140), 1, Qt.DashLine))
         painter.drawEllipse(self._brush_pos.x() - r + 1, self._brush_pos.y() - r + 1,
                             r * 2 - 2, r * 2 - 2)
+
+
+    def set_committed_roi(self, roi_dict: dict):
+        """Store the committed ROI shape for persistent on-screen visualisation.
+
+        Coordinates in roi_dict are in display pixels at the time of the call;
+        they are immediately normalised to [0, 1] of the current pixmap size so
+        that the outline stays in the correct position after zoom changes.
+
+        Expected keys by type:
+            rectangle – x, y, w, h
+            circle    – cx, cy, r
+            polygon   – pts (list of (x, y) tuples)
+            all       – no extra keys (draws border around the full pixmap)
+        """
+        pm = self.pixmap()
+        if pm is None or pm.width() == 0 or pm.height() == 0:
+            self._committed_roi_norm = None
+            return
+
+        pw, ph  = pm.width(), pm.height()
+        t       = roi_dict['type']
+        norm    = {'type': t}
+
+        if t == 'rectangle':
+            norm.update(
+                x=roi_dict['x'] / pw,  y=roi_dict['y'] / ph,
+                w=roi_dict['w'] / pw,  h=roi_dict['h'] / ph,
+            )
+        elif t == 'circle':
+            avg = (pw + ph) / 2
+            norm.update(
+                cx=roi_dict['cx'] / pw,
+                cy=roi_dict['cy'] / ph,
+                r =roi_dict['r']  / avg,
+            )
+        elif t == 'polygon':
+            norm.update(pts=[(p[0] / pw, p[1] / ph) for p in roi_dict['pts']])
+        # 'all' type has no extra keys
+
+        self._committed_roi_norm = norm
+        self.update()
+
+
+    def clear_roi_display(self):
+        """Remove the committed selection overlay from the display."""
+        self._committed_roi_norm = None
+        self.update()
+
+
+    def _paint_committed_roi(self, painter: QPainter):
+        """Draw the persisted selection outline using a marching-ants style
+        (two overlapping dashed pens: black outer + yellow inner)."""
+        if self._committed_roi_norm is None:
+            return
+
+        pm = self.pixmap()
+        if pm is None or pm.width() == 0 or pm.height() == 0:
+            return
+
+        pw, ph = pm.width(), pm.height()
+        norm   = self._committed_roi_norm
+        t      = norm['type']
+
+        painter.setBrush(Qt.NoBrush)
+
+        # Draw twice: black outer dash then yellow inner dash (offset by 4 units)
+        for color, offset in (
+            (QColor(0,   0,   0, 200), 0),
+            (QColor(255, 210, 0, 230), 4),
+        ):
+            pen = QPen(color, 1, Qt.DashLine)
+            pen.setDashOffset(offset)
+            painter.setPen(pen)
+
+            if t == 'rectangle':
+                x = int(norm['x'] * pw)
+                y = int(norm['y'] * ph)
+                w = int(norm['w'] * pw)
+                h = int(norm['h'] * ph)
+                painter.drawRect(x, y, w, h)
+
+            elif t == 'circle':
+                avg = (pw + ph) / 2
+                cx  = int(norm['cx'] * pw)
+                cy  = int(norm['cy'] * ph)
+                r   = int(norm['r']  * avg)
+                painter.drawEllipse(QPoint(cx, cy), r, r)
+
+            elif t == 'polygon':
+                pts = norm['pts']
+                n   = len(pts)
+                for i in range(n):
+                    x1 = int(pts[i][0]           * pw)
+                    y1 = int(pts[i][1]           * ph)
+                    x2 = int(pts[(i + 1) % n][0] * pw)
+                    y2 = int(pts[(i + 1) % n][1] * ph)
+                    painter.drawLine(x1, y1, x2, y2)
+
+            elif t == 'all':
+                painter.drawRect(0, 0, pw - 1, ph - 1)
 
 
 class ImagePanel(QScrollArea):
