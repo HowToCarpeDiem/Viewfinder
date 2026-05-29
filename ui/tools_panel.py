@@ -27,15 +27,45 @@ QPushButton:checked:hover {
 """
 
 
+def _make_slider_row(parent_layout, label: str, lo: int, hi: int, default: int):
+    """Helper: add a labelled slider with a live value indicator.
+
+    Returns (slider, value_label).
+    """
+    ly_header = QHBoxLayout()
+    ly_header.setContentsMargins(0, 0, 0, 2)
+    ly_header.addWidget(QLabel(label))
+    ly_header.addStretch()
+    lbl_val = QLabel(f'{default:+d}' if default != 0 else '0')
+    lbl_val.setStyleSheet('color: #444; font-size: 10px; min-width: 30px;')
+    ly_header.addWidget(lbl_val)
+    parent_layout.addLayout(ly_header)
+
+    slider = QSlider(Qt.Horizontal)
+    slider.setRange(lo, hi)
+    slider.setValue(default)
+    slider.valueChanged.connect(
+        lambda v, lbl=lbl_val: lbl.setText(f'{v:+d}' if v != 0 else '0')
+    )
+    parent_layout.addWidget(slider)
+    return slider, lbl_val
+
+
 class ToolsPanel(QWidget):
     """Left panel: checkable tool buttons at the top, a permanent ROI
     section (always visible between tools and options), and tool-specific
     options at the bottom."""
 
-    grayscale_requested = Signal()
-    blur_requested      = Signal()
-    active_tool_changed = Signal(str)   # 'grayscale' | 'blur' | 'none'
-    roi_mode_changed    = Signal(str)   # 'rectangle' | 'circle' | 'polygon' | 'brush' | 'none'
+    # Tool-level signals
+    grayscale_requested  = Signal()
+    brightness_requested = Signal()
+    contrast_requested   = Signal()
+    saturation_requested = Signal()
+    blur_requested       = Signal()
+    active_tool_changed  = Signal(str)   # 'adjustments' | 'blur' | 'none'
+
+    # ROI signals
+    roi_mode_changed = Signal(str)   # 'rectangle' | 'circle' | 'polygon' | 'brush' | 'none'
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,16 +74,16 @@ class ToolsPanel(QWidget):
         ly_main.setContentsMargins(4, 4, 4, 4)
         ly_main.setSpacing(6)
 
-        # ── Tool buttons row ──────────────────────────────────────────────────
+        # Tool buttons row
         ly_tools = QHBoxLayout()
         ly_main.addLayout(ly_tools)
 
-        self.btn_grayscale = QPushButton()
-        self.btn_grayscale.setIcon(QIcon('assets/grayscale.png'))
-        self.btn_grayscale.setToolTip('Grayscale')
-        self.btn_grayscale.setCheckable(True)
-        self.btn_grayscale.setStyleSheet(_BTN_STYLE)
-        ly_tools.addWidget(self.btn_grayscale)
+        self.btn_adjustments = QPushButton()
+        self.btn_adjustments.setIcon(QIcon('assets/grayscale.png'))
+        self.btn_adjustments.setToolTip('Adjustments  (brightness, contrast, saturation, grayscale)')
+        self.btn_adjustments.setCheckable(True)
+        self.btn_adjustments.setStyleSheet(_BTN_STYLE)
+        ly_tools.addWidget(self.btn_adjustments)
 
         self.btn_blur = QPushButton()
         self.btn_blur.setIcon(QIcon('assets/blur.png'))
@@ -64,7 +94,7 @@ class ToolsPanel(QWidget):
 
         ly_tools.addStretch()
 
-        # ── Permanent ROI / Selection section ─────────────────────────────────
+        #Permanent ROI / Selection section
         sep_top = QFrame()
         sep_top.setFrameShape(QFrame.HLine)
         sep_top.setFrameShadow(QFrame.Sunken)
@@ -114,7 +144,7 @@ class ToolsPanel(QWidget):
         sep_bot.setFrameShadow(QFrame.Sunken)
         ly_main.addWidget(sep_bot)
 
-        # ── Tool options (stacked widget) ─────────────────────────────────────
+        # Tool options (stacked widget)
         self.tool_options = QStackedWidget()
         ly_main.addWidget(self.tool_options)
 
@@ -126,13 +156,45 @@ class ToolsPanel(QWidget):
         ly_default.addWidget(QLabel('Choose tool'))
         self.tool_options.addWidget(self._page_default)
 
-        # Grayscale page
-        self._page_grayscale = QWidget()
-        ly_grayscale = QVBoxLayout(self._page_grayscale)
+        #Adjustments page
+        self._page_adjustments = QWidget()
+        ly_adj = QVBoxLayout(self._page_adjustments)
+        ly_adj.setSpacing(4)
+        ly_adj.setContentsMargins(2, 4, 2, 4)
+
+        # Brightness
+        self.slider_brightness, _ = _make_slider_row(ly_adj, 'Brightness:', -100, 100, 0)
+        self.btn_apply_brightness = QPushButton('Apply Brightness')
+        ly_adj.addWidget(self.btn_apply_brightness)
+
+        ly_adj.addSpacing(6)
+
+        # Contrast
+        self.slider_contrast, _ = _make_slider_row(ly_adj, 'Contrast:', -100, 100, 0)
+        self.btn_apply_contrast = QPushButton('Apply Contrast')
+        ly_adj.addWidget(self.btn_apply_contrast)
+
+        ly_adj.addSpacing(6)
+
+        # Saturation
+        self.slider_saturation, _ = _make_slider_row(ly_adj, 'Saturation:', -100, 100, 0)
+        self.btn_apply_saturation = QPushButton('Apply Saturation')
+        ly_adj.addWidget(self.btn_apply_saturation)
+
+        ly_adj.addSpacing(6)
+
+        # Separator before grayscale
+        sep_gray = QFrame()
+        sep_gray.setFrameShape(QFrame.HLine)
+        sep_gray.setFrameShadow(QFrame.Sunken)
+        ly_adj.addWidget(sep_gray)
+
+        # Grayscale (no slider needed)
         self.btn_apply_grayscale = QPushButton('Apply Grayscale')
-        ly_grayscale.addWidget(self.btn_apply_grayscale)
-        ly_grayscale.addStretch()
-        self.tool_options.addWidget(self._page_grayscale)
+        ly_adj.addWidget(self.btn_apply_grayscale)
+
+        ly_adj.addStretch()
+        self.tool_options.addWidget(self._page_adjustments)
 
         # Blur page
         self._page_blur = QWidget()
@@ -156,12 +218,15 @@ class ToolsPanel(QWidget):
         ly_blur.addStretch()
         self.tool_options.addWidget(self._page_blur)
 
-        # ── Signal connections ────────────────────────────────────────────────
-        self.btn_grayscale.clicked.connect(
-            lambda: self._on_tool_clicked(self.btn_grayscale, 'grayscale'))
+        # Signal connections
+        self.btn_adjustments.clicked.connect(
+            lambda: self._on_tool_clicked(self.btn_adjustments, 'adjustments'))
         self.btn_blur.clicked.connect(
             lambda: self._on_tool_clicked(self.btn_blur, 'blur'))
 
+        self.btn_apply_brightness.clicked.connect(self.brightness_requested)
+        self.btn_apply_contrast.clicked.connect(self.contrast_requested)
+        self.btn_apply_saturation.clicked.connect(self.saturation_requested)
         self.btn_apply_grayscale.clicked.connect(self.grayscale_requested)
         self.btn_apply_blur.clicked.connect(self.blur_requested)
 
@@ -180,13 +245,13 @@ class ToolsPanel(QWidget):
         ROI section is independent and not affected by tool switching."""
         is_now_checked = clicked_btn.isChecked()
 
-        for btn in (self.btn_grayscale, self.btn_blur):
+        for btn in (self.btn_adjustments, self.btn_blur):
             if btn is not clicked_btn:
                 btn.setChecked(False)
 
         if is_now_checked:
-            if tool_name == 'grayscale':
-                self.tool_options.setCurrentWidget(self._page_grayscale)
+            if tool_name == 'adjustments':
+                self.tool_options.setCurrentWidget(self._page_adjustments)
             elif tool_name == 'blur':
                 self.tool_options.setCurrentWidget(self._page_blur)
             self.active_tool_changed.emit(tool_name)
@@ -214,15 +279,26 @@ class ToolsPanel(QWidget):
 
 
     def set_roi_status(self, text: str):
-        """Update the selection status label shown next to 'Selection:'."""
+        """Update the selection status label."""
         self.lbl_roi_status.setText(text)
 
 
-    def get_blur_kernel(self):
+    def get_brightness(self) -> int:
+        """Return the current brightness adjustment value (-100 … +100)."""
+        return self.slider_brightness.value()
+
+    def get_contrast(self) -> int:
+        """Return the current contrast adjustment value (-100 … +100)."""
+        return self.slider_contrast.value()
+
+    def get_saturation(self) -> int:
+        """Return the current saturation adjustment value (-100 … +100)."""
+        return self.slider_saturation.value()
+
+    def get_blur_kernel(self) -> int:
         """Return current blur kernel size (always an odd number)."""
         return self.slider_blur.value() * 2 + 1
 
-
-    def get_brush_size(self):
+    def get_brush_size(self) -> int:
         """Return current brush radius in display pixels."""
         return self.slider_brush_size.value()

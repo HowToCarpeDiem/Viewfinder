@@ -23,11 +23,12 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.img_current   = None   # always a BGR numpy array
-        self.history       = []     # list of img_current copies for undo
+        self.history       = []     # undo stack — list of img_current copies
+        self.redo_stack    = []     # redo stack — filled by undo, cleared by any edit
         self.image_list    = []     # flat list of image paths (arrow navigation)
         self.current_index = -1
         self.roi_mask           = None   # np.ndarray (H, W) uint8 or None (= whole image)
-        self._active_tool       = 'none' # currently open tool: 'grayscale' | 'blur' | 'none'
+        self._active_tool       = 'none' # currently open tool: 'adjustments' | 'blur' | 'none'
         self._brush_blurred_ref = None   # precomputed blur reference for brush strokes
         self._brush_gray_ref    = None   # precomputed greyscale reference for brush strokes
 
@@ -65,6 +66,18 @@ class MainWindow(QMainWindow):
         self.shortcut_undo = QShortcut(QKeySequence('Ctrl+Z'), self)
         self.shortcut_undo.activated.connect(self.undo_action)
 
+        self.shortcut_redo = QShortcut(QKeySequence('Ctrl+Y'), self)
+        self.shortcut_redo.activated.connect(self.redo_action)
+
+        self.shortcut_invert_roi = QShortcut(QKeySequence('Ctrl+I'), self)
+        self.shortcut_invert_roi.activated.connect(self.invert_roi)
+
+        self.shortcut_crop = QShortcut(QKeySequence('Ctrl+K'), self)
+        self.shortcut_crop.activated.connect(self.crop_to_selection)
+
+        self.shortcut_cut = QShortcut(QKeySequence('Ctrl+X'), self)
+        self.shortcut_cut.activated.connect(self.cut_selection)
+
         self.shortcut_select_all = QShortcut(QKeySequence('Ctrl+A'), self)
         self.shortcut_select_all.activated.connect(self._select_all)
 
@@ -81,6 +94,9 @@ class MainWindow(QMainWindow):
 
         # Signal connections — tools panel
         self.tools_panel.grayscale_requested.connect(self.apply_grayscale)
+        self.tools_panel.brightness_requested.connect(self.apply_brightness)
+        self.tools_panel.contrast_requested.connect(self.apply_contrast)
+        self.tools_panel.saturation_requested.connect(self.apply_saturation)
         self.tools_panel.blur_requested.connect(self.apply_blur)
         self.tools_panel.active_tool_changed.connect(self._on_tool_changed)
         self.tools_panel.roi_mode_changed.connect(self._on_roi_mode_changed)
@@ -150,6 +166,7 @@ class MainWindow(QMainWindow):
 
         self.img_current = img
         self.history.clear()
+        self.redo_stack.clear()
         self._clear_roi()   # reset selection when switching to a new image
 
         if path in self.image_list:
@@ -200,7 +217,7 @@ class MainWindow(QMainWindow):
         self.image_panel.lb_image._brush_radius = self.tools_panel.get_brush_size()
 
 
-    # ── ROI / Selection management ─────────────────────────────────────────────
+    #ROI / Selection management 
 
     def _on_roi_rect_set(self, x: int, y: int, w: int, h: int):
         """Convert a drawn rectangle into an active selection mask."""
@@ -298,9 +315,9 @@ class MainWindow(QMainWindow):
         2. Otherwise clear the committed selection entirely.
         """
         lb = self.image_panel.lb_image
-        if lb.draw_mode == 'polygon' and lb._polygon_points:
-            lb._polygon_points.clear()
-            lb._cursor_pos = None
+        if lb.draw_mode == 'polygon' and lb._polygon_pts_n:
+            lb._polygon_pts_n.clear()
+            lb._cursor_pos_n = None
             lb.update()
         else:
             self._clear_roi()
@@ -323,12 +340,59 @@ class MainWindow(QMainWindow):
         self._set_roi_mask(mask, {'type': 'all'})
 
 
-    # ── Image operations ───────────────────────────────────────────────────────
+    def invert_roi(self):
+        """Ctrl+I: flip selected / unselected pixels (bitwise NOT on roi_mask).
+
+        Has no effect when no selection is active.  The shape outline is kept
+        and the full-image border is added so the user can see both boundaries
+        of the newly selected region (everything outside the original shape).
+        Calling Ctrl+I a second time reverts back to the original selection.
+        """
+        if self.roi_mask is None:
+            return
+        self.roi_mask = cv2.bitwise_not(self.roi_mask)
+        # Toggle the visual: keep shape outline, add/remove the image border
+        self.image_panel.lb_image.invert_roi_display()
+        # Toggle status label: 'Rect 120×80' ↔ 'Inverted Rect 120×80'
+        current = self.tools_panel.lbl_roi_status.text()
+        if current.startswith('Inverted '):
+            self.tools_panel.set_roi_status(current[len('Inverted '):])
+        else:
+            self.tools_panel.set_roi_status(f'Inverted {current}')
+
+
+    # Image operations
 
     def undo_action(self):
+        """Ctrl+Z: revert to the previous image state."""
         if self.history:
+            self.redo_stack.append(self.img_current.copy())
             self.img_current = self.history.pop()
             self.image_panel.update_image(self.img_current)
+
+
+    def redo_action(self):
+        """Ctrl+Y: re-apply the last undone edit."""
+        if self.redo_stack:
+            self.history.append(self.img_current.copy())
+            self.img_current = self.redo_stack.pop()
+            self.image_panel.update_image(self.img_current)
+
+
+    def _push_history(self):
+        """Save the current image to the undo stack and wipe the redo stack.
+        Must be called exactly once before every destructive edit."""
+        self.history.append(self.img_current.copy())
+        self.redo_stack.clear()
+
+
+    def _bgr_view(self) -> np.ndarray:
+        """Return a (possibly writable) view of only the BGR channels.
+
+        Works transparently for both BGR (3-ch) and BGRA (4-ch) images.
+        Write operations on the returned slice propagate back to img_current.
+        """
+        return self.img_current[:, :, :3]
 
 
     def apply_grayscale(self):
@@ -336,12 +400,81 @@ class MainWindow(QMainWindow):
         if self.img_current is None:
             return
 
-        self.history.append(self.img_current.copy())
+        self._push_history()
 
         mask       = self._get_active_mask()
-        img_gray   = cv2.cvtColor(self.img_current, cv2.COLOR_BGR2GRAY)
+        bgr        = self._bgr_view()
+        img_gray   = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         img_gray_3 = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-        self.img_current[mask == 255] = img_gray_3[mask == 255]
+        bgr[mask == 255] = img_gray_3[mask == 255]
+        self.image_panel.update_image(self.img_current)
+
+
+    def apply_brightness(self):
+        """Shift pixel brightness within the active selection.
+
+        Value comes from tools_panel.get_brightness() (-100 … +100).
+        Positive values brighten, negative values darken.
+        """
+        if self.img_current is None:
+            return
+        value = self.tools_panel.get_brightness()
+        if value == 0:
+            return
+
+        self._push_history()
+        mask     = self._get_active_mask()
+        bgr      = self._bgr_view()
+        adjusted = np.clip(bgr.astype(np.int16) + value, 0, 255).astype(np.uint8)
+        bgr[mask == 255] = adjusted[mask == 255]
+        self.image_panel.update_image(self.img_current)
+
+
+    def apply_contrast(self):
+        """Scale pixel contrast within the active selection.
+
+        Value comes from tools_panel.get_contrast() (-100 … +100).
+        0 = no change; positive = more contrast; negative = less contrast.
+        Alpha factor = 1 + value/100 (range 0.0 – 2.0).
+        """
+        if self.img_current is None:
+            return
+        value = self.tools_panel.get_contrast()
+        if value == 0:
+            return
+
+        self._push_history()
+        mask    = self._get_active_mask()
+        bgr     = self._bgr_view()
+        alpha_f = 1.0 + value / 100.0
+        # convertScaleAbs: dst = saturate(|alpha * src + beta|)
+        adjusted = cv2.convertScaleAbs(bgr, alpha=alpha_f, beta=0)
+        bgr[mask == 255] = adjusted[mask == 255]
+        self.image_panel.update_image(self.img_current)
+
+
+    def apply_saturation(self):
+        """Scale colour saturation within the active selection.
+
+        Value comes from tools_panel.get_saturation() (-100 … +100).
+        0 = no change; +100 = double saturation; -100 = fully desaturated.
+        Scale factor = 1 + value/100 (range 0.0 – 2.0), applied to the S
+        channel in HSV space.
+        """
+        if self.img_current is None:
+            return
+        value = self.tools_panel.get_saturation()
+        if value == 0:
+            return
+
+        self._push_history()
+        mask    = self._get_active_mask()
+        bgr     = self._bgr_view()
+        scale   = 1.0 + value / 100.0
+        img_hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * scale, 0, 255)
+        adjusted = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        bgr[mask == 255] = adjusted[mask == 255]
         self.image_panel.update_image(self.img_current)
 
 
@@ -350,12 +483,13 @@ class MainWindow(QMainWindow):
         if self.img_current is None:
             return
 
-        self.history.append(self.img_current.copy())
+        self._push_history()
 
         mask    = self._get_active_mask()
+        bgr     = self._bgr_view()
         kernel  = self.tools_panel.get_blur_kernel()
-        blurred = cv2.GaussianBlur(self.img_current, (kernel, kernel), 0)
-        self.img_current[mask == 255] = blurred[mask == 255]
+        blurred = cv2.GaussianBlur(bgr, (kernel, kernel), 0)
+        bgr[mask == 255] = blurred[mask == 255]
         self.image_panel.update_image(self.img_current)
 
 
@@ -372,9 +506,10 @@ class MainWindow(QMainWindow):
     def _apply_mask_blur(self, mask: np.ndarray):
         """Apply Gaussian blur to img_current in-place, restricted to mask==255 pixels.
         Used internally by the brush blur tool."""
+        bgr     = self._bgr_view()
         kernel  = self.tools_panel.get_blur_kernel()
-        blurred = cv2.GaussianBlur(self.img_current, (kernel, kernel), 0)
-        self.img_current[mask == 255] = blurred[mask == 255]
+        blurred = cv2.GaussianBlur(bgr, (kernel, kernel), 0)
+        bgr[mask == 255] = blurred[mask == 255]
         self.image_panel.refresh()
 
 
@@ -382,12 +517,12 @@ class MainWindow(QMainWindow):
         """Dispatch a brush stroke to the method matching the active tool.
 
         The brush always paints with whichever tool is currently open in the
-        tool options panel (Blur or Grayscale).  If no tool is selected the
-        stroke is silently ignored.
+        tool options panel (Blur or Adjustments/Grayscale).  If no tool is
+        selected the stroke is silently ignored.
         """
         if self._active_tool == 'blur':
             self.apply_blur_brush(x, y, is_first_point)
-        elif self._active_tool == 'grayscale':
+        elif self._active_tool == 'adjustments':
             self.apply_grayscale_brush(x, y, is_first_point)
         # else: no tool active — do nothing
 
@@ -409,7 +544,7 @@ class MainWindow(QMainWindow):
             return
 
         if is_first_point:
-            self.history.append(self.img_current.copy())
+            self._push_history()
             # Precompute the fully blurred version of the current image.
             # All brush dabs in this stroke copy from this snapshot,
             # so GaussianBlur is only called once per mouse-down event.
@@ -448,7 +583,7 @@ class MainWindow(QMainWindow):
             return
 
         if is_first_point:
-            self.history.append(self.img_current.copy())
+            self._push_history()
             # Precompute greyscale version once for the whole stroke
             img_gray           = cv2.cvtColor(self.img_current, cv2.COLOR_BGR2GRAY)
             self._brush_gray_ref = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
@@ -468,6 +603,65 @@ class MainWindow(QMainWindow):
         self.image_panel.refresh()
 
 
+    def crop_to_selection(self):
+        """Ctrl+K: crop the image to the bounding box of the active selection.
+
+        For rectangular selections the result is a plain BGR crop.
+        For circles and polygons the region outside the mask is made
+        transparent (BGRA with alpha=0), and the image is then cropped
+        to the tight bounding box of the shape.
+        Has no effect when no selection is active.
+        """
+        if self.img_current is None or self.roi_mask is None:
+            return
+
+        # Find the tight bounding box of all selected pixels
+        ys, xs = np.where(self.roi_mask == 255)
+        if len(ys) == 0:
+            return  # empty mask — nothing to crop
+
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+
+        self._push_history()
+
+        cropped      = self.img_current[y1:y2, x1:x2].copy()
+        mask_cropped = self.roi_mask[y1:y2, x1:x2]
+
+        # Check whether every pixel in the bounding box is selected
+        is_fully_rect = bool(np.all(mask_cropped == 255))
+
+        if not is_fully_rect:
+            # Non-rectangular shape: add alpha, set 0 outside the mask
+            if cropped.shape[2] == 3:
+                cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2BGRA)
+            cropped[:, :, 3] = mask_cropped
+
+        self.img_current = cropped
+        self._clear_roi()
+        self.image_panel.set_image(self.img_current)
+
+
+    def cut_selection(self):
+        """Ctrl+X: make the selected area fully transparent (alpha = 0).
+
+        The image is automatically converted to BGRA if it is currently BGR.
+        Has no effect when no selection is active.
+        """
+        if self.img_current is None or self.roi_mask is None:
+            return
+
+        self._push_history()
+
+        # Ensure we have an alpha channel
+        if self.img_current.shape[2] == 3:
+            self.img_current = cv2.cvtColor(self.img_current, cv2.COLOR_BGR2BGRA)
+
+        # Zero-out alpha where the mask is selected
+        self.img_current[:, :, 3][self.roi_mask == 255] = 0
+        self.image_panel.update_image(self.img_current)
+
+
     def save_image(self):
         if self.img_current is None:
             print('First, load an image.')
@@ -475,7 +669,19 @@ class MainWindow(QMainWindow):
 
         path, _ = QFileDialog.getSaveFileName(
             self, 'Save Image', '',
-            'Images (*.png *.jpg *.jpeg *.bmp)'
+            'PNG with transparency (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp)'
         )
-        if path:
-            cv2.imwrite(path, self.img_current)
+        if not path:
+            return
+
+        img_to_save = self.img_current
+        # If saving to a format that does not support alpha, flatten onto white
+        ext = path.rsplit('.', 1)[-1].lower()
+        if ext in ('jpg', 'jpeg', 'bmp') and img_to_save.shape[2] == 4:
+            bg    = np.ones_like(img_to_save[:, :, :3], dtype=np.uint8) * 255
+            alpha = img_to_save[:, :, 3:4].astype(np.float32) / 255.0
+            bgr   = img_to_save[:, :, :3].astype(np.float32)
+            flat  = (bgr * alpha + bg.astype(np.float32) * (1.0 - alpha))
+            img_to_save = np.clip(flat, 0, 255).astype(np.uint8)
+
+        cv2.imwrite(path, img_to_save)

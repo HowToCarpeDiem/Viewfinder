@@ -1,6 +1,7 @@
 import math
 
 import cv2
+import numpy as np
 from PySide6.QtWidgets import QScrollArea, QLabel
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PySide6.QtCore import Qt, Signal, QPoint
@@ -90,7 +91,6 @@ class InteractiveLabel(QLabel):
             self._pan_press_global = g
             self._pan_last         = g
             self._pan_did_drag     = False
-            # Cursor stays as-is until the drag threshold is crossed
             return
 
         if event.button() != Qt.LeftButton or self.draw_mode is None:
@@ -349,9 +349,29 @@ class InteractiveLabel(QLabel):
         self.update()
 
 
+    def invert_roi_display(self):
+        """Toggle the 'inverted' flag on the committed ROI.
+
+        When inverted, _paint_committed_roi draws both the shape outline AND
+        the full-image border, visually conveying 'everything outside the
+        shape is selected'.  Calling this a second time restores the normal
+        (non-inverted) outline.
+        Has no effect if no committed ROI is currently displayed.
+        """
+        if self._committed_roi_norm is not None:
+            was = self._committed_roi_norm.get('inverted', False)
+            self._committed_roi_norm['inverted'] = not was
+            self.update()
+
+
     def _paint_committed_roi(self, painter: QPainter):
         """Draw the persisted selection outline using a marching-ants style
-        (two overlapping dashed pens: black outer + yellow inner)."""
+        (two overlapping dashed pens: black outer + yellow inner).
+
+        When the selection is inverted the image border is drawn in addition
+        to the shape outline so the user can see both boundaries of the
+        selected region (everything outside the shape).
+        """
         if self._committed_roi_norm is None:
             return
 
@@ -359,9 +379,10 @@ class InteractiveLabel(QLabel):
         if pm is None or pm.width() == 0 or pm.height() == 0:
             return
 
-        pw, ph = pm.width(), pm.height()
-        norm   = self._committed_roi_norm
-        t      = norm['type']
+        pw, ph      = pm.width(), pm.height()
+        norm        = self._committed_roi_norm
+        t           = norm['type']
+        is_inverted = norm.get('inverted', False)
 
         painter.setBrush(Qt.NoBrush)
 
@@ -373,6 +394,11 @@ class InteractiveLabel(QLabel):
             pen = QPen(color, 1, Qt.DashLine)
             pen.setDashOffset(offset)
             painter.setPen(pen)
+
+            # Inverted: also draw the full-image border so both boundaries
+            # of the selected region are visible.
+            if is_inverted and t != 'all':
+                painter.drawRect(0, 0, pw - 1, ph - 1)
 
             if t == 'rectangle':
                 x = int(norm['x'] * pw)
@@ -399,6 +425,8 @@ class InteractiveLabel(QLabel):
                     painter.drawLine(x1, y1, x2, y2)
 
             elif t == 'all':
+                # 'all' inverted = nothing selected; draw border anyway for
+                # visual consistency (mirrors the no-invert case).
                 painter.drawRect(0, 0, pw - 1, ph - 1)
 
 
@@ -433,16 +461,16 @@ class ImagePanel(QScrollArea):
         self.lb_image.pan_delta.connect(self._on_pan)
 
 
-    def set_image(self, img_bgr):
-        """Display a new image and reset zoom to 1.0."""
-        self._img_bgr = img_bgr
+    def set_image(self, img):
+        """Display a new image (BGR or BGRA) and reset zoom to 1.0."""
+        self._img_bgr = img
         self.scale_factor = 1.0
         self._render()
 
 
-    def update_image(self, img_bgr):
-        """Replace the displayed image without changing the current zoom level."""
-        self._img_bgr = img_bgr
+    def update_image(self, img):
+        """Replace the displayed image (BGR or BGRA) without changing the current zoom level."""
+        self._img_bgr = img
         self._render()
 
 
@@ -483,9 +511,17 @@ class ImagePanel(QScrollArea):
         if self._img_bgr is None:
             return
 
-        img_rgb = cv2.cvtColor(self._img_bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = img_rgb.shape
-        q_img = QImage(img_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        img = self._img_bgr
+        if img.ndim == 3 and img.shape[2] == 4:
+            # BGRA — composite over a checkerboard so transparency is visible
+            img_display = self._composite_on_checker(img)
+            h, w = img_display.shape[:2]
+            q_img = QImage(img_display.data, w, h, w * 3, QImage.Format_RGB888)
+        else:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w = img_rgb.shape[:2]
+            q_img = QImage(img_rgb.data, w, h, w * 3, QImage.Format_RGB888)
+
         pixmap = QPixmap.fromImage(q_img)
 
         vp_w = max(1, self.viewport().width())
@@ -496,3 +532,27 @@ class ImagePanel(QScrollArea):
         scaled = pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.lb_image.setPixmap(scaled)
         self.lb_image.adjustSize()
+
+
+    @staticmethod
+    def _composite_on_checker(img_bgra: np.ndarray) -> np.ndarray:
+        """Alpha-composite a BGRA image over an 8×8 grey/white checkerboard.
+
+        Returns an RGB uint8 array suitable for display (no alpha channel).
+        """
+        h, w = img_bgra.shape[:2]
+        tile = 8  # checker tile size in pixels
+
+        # Vectorised checkerboard: XOR of tile-row and tile-col parity
+        rows = np.arange(h, dtype=np.uint8) // tile
+        cols = np.arange(w, dtype=np.uint8) // tile
+        light = ((rows[:, np.newaxis] ^ cols[np.newaxis, :]) & 1).astype(np.uint8)
+        checker_grey = (light * 51 + 204).astype(np.uint8)   # 204 or 255
+        checker = np.stack([checker_grey] * 3, axis=-1)
+
+        # Separate channels and blend: out = fg * a + bg * (1 - a)
+        bgr    = img_bgra[:, :, :3].astype(np.float32)
+        alpha  = (img_bgra[:, :, 3] / 255.0)[:, :, np.newaxis]
+        rgb_fg = bgr[:, :, ::-1]                              # BGR → RGB
+        blended = rgb_fg * alpha + checker.astype(np.float32) * (1.0 - alpha)
+        return np.clip(blended, 0, 255).astype(np.uint8)
