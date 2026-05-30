@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QFrame,
-    QTabWidget, QFileDialog, QSizePolicy, QTreeWidget
+    QTabWidget, QFileDialog, QSizePolicy, QTreeWidget,
+    QDialog, QVBoxLayout, QLabel, QScrollArea, QDialogButtonBox
 )
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtCore import Qt
@@ -98,6 +99,7 @@ class MainWindow(QMainWindow):
         self.tools_panel.contrast_requested.connect(self.apply_contrast)
         self.tools_panel.saturation_requested.connect(self.apply_saturation)
         self.tools_panel.blur_requested.connect(self.apply_blur)
+        self.tools_panel.transform_requested.connect(self.apply_transform)
         self.tools_panel.active_tool_changed.connect(self._on_tool_changed)
         self.tools_panel.roi_mode_changed.connect(self._on_roi_mode_changed)
 
@@ -133,6 +135,13 @@ class MainWindow(QMainWindow):
         save_action.setShortcut(QKeySequence('Ctrl+S'))
         save_action.triggered.connect(self.save_image)
         file_menu.addAction(save_action)
+
+        settings_menu = menu_bar.addMenu('Settings')
+
+        shortcuts_action = QAction('Shortcuts', self)
+        shortcuts_action.setShortcut(QKeySequence('Ctrl+/'))
+        shortcuts_action.triggered.connect(self._show_shortcuts_dialog)
+        settings_menu.addAction(shortcuts_action)
 
 
     def load_image(self):
@@ -662,6 +671,59 @@ class MainWindow(QMainWindow):
         self.image_panel.update_image(self.img_current)
 
 
+    def apply_transform(self, operation: str):
+        """Apply a flip or rotation to the current image.
+
+        Supported operations:
+            flip_h      — mirror left ↔ right  (cv2.flip axis 1)
+            flip_v      — mirror top  ↕ bottom (cv2.flip axis 0)
+            rotate_cw   — 90° clockwise
+            rotate_ccw  — 90° counter-clockwise
+            rotate_180  — 180°
+
+        The ROI mask is transformed together with the image for operations
+        that preserve its shape (flip_h, flip_v, rotate_180).  For 90°
+        rotations the mask is cleared because the image dimensions change.
+        """
+        if self.img_current is None:
+            return
+
+        self._push_history()
+
+        if operation == 'flip_h':
+            self.img_current = cv2.flip(self.img_current, 1)
+            if self.roi_mask is not None:
+                self.roi_mask = cv2.flip(self.roi_mask, 1)
+                # Flip the visual overlay so it stays on the correct spot
+                self.image_panel.lb_image.clear_roi_display()
+                self.tools_panel.set_roi_status('Rect (flipped)')
+
+        elif operation == 'flip_v':
+            self.img_current = cv2.flip(self.img_current, 0)
+            if self.roi_mask is not None:
+                self.roi_mask = cv2.flip(self.roi_mask, 0)
+                self.image_panel.lb_image.clear_roi_display()
+                self.tools_panel.set_roi_status('Rect (flipped)')
+
+        elif operation == 'rotate_cw':
+            self.img_current = cv2.rotate(self.img_current, cv2.ROTATE_90_CLOCKWISE)
+            self._clear_roi()   # 90° rotation changes image dimensions
+
+        elif operation == 'rotate_ccw':
+            self.img_current = cv2.rotate(self.img_current, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            self._clear_roi()
+
+        elif operation == 'rotate_180':
+            self.img_current = cv2.rotate(self.img_current, cv2.ROTATE_180)
+            if self.roi_mask is not None:
+                self.roi_mask = cv2.rotate(self.roi_mask, cv2.ROTATE_180)
+                self.image_panel.lb_image.clear_roi_display()
+                self.tools_panel.set_roi_status('Rect (rotated)')
+
+        # set_image resets zoom — appropriate because rotation may change aspect ratio
+        self.image_panel.set_image(self.img_current)
+
+
     def save_image(self):
         if self.img_current is None:
             print('First, load an image.')
@@ -685,3 +747,83 @@ class MainWindow(QMainWindow):
             img_to_save = np.clip(flat, 0, 255).astype(np.uint8)
 
         cv2.imwrite(path, img_to_save)
+    def _show_shortcuts_dialog(self):
+        """Display a modal dialog listing all keyboard shortcuts."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Keyboard Shortcuts')
+        dlg.setMinimumWidth(480)
+
+        ly = QVBoxLayout(dlg)
+        ly.setSpacing(0)
+        ly.setContentsMargins(16, 12, 16, 12)
+
+        SECTIONS = [
+            ('File', [
+                ('Ctrl+O',           'Open image'),
+                ('Ctrl+Shift+O',     'Open directory'),
+                ('Ctrl+S',           'Save image'),
+            ]),
+            ('Navigation', [
+                ('← / → Arrow keys',  'Previous / next image'),
+            ]),
+            ('Edit', [
+                ('Ctrl+Z',           'Undo'),
+                ('Ctrl+Y',           'Redo'),
+            ]),
+            ('Selection (ROI)', [
+                ('Ctrl+A',           'Select all'),
+                ('Ctrl+I',           'Invert selection'),
+                ('Ctrl+K',           'Crop to selection'),
+                ('Ctrl+X',           'Cut selection (make transparent)'),
+                ('Esc',              'Cancel polygon  /  clear selection'),
+                ('RMB click',        'Close polygon (no drag)'),
+            ]),
+            ('View', [
+                ('Ctrl + Scroll',    'Zoom in / out'),
+                ('RMB drag',         'Pan image'),
+            ]),
+            ('Other', [
+                ('Ctrl+/',           'Show this shortcuts window'),
+            ]),
+        ]
+
+        # Styles
+        section_style = (
+            'font-weight: bold; font-size: 12px;'
+            'margin-top: 10px; margin-bottom: 2px; color: #222;'
+        )
+        row_key_style  = 'font-family: monospace; color: #1a73e8; min-width: 160px;'
+        row_desc_style = 'color: #333;'
+        sep_style      = 'color: #ccc; margin: 0;'
+
+        for section_title, rows in SECTIONS:
+            lbl_section = QLabel(section_title)
+            lbl_section.setStyleSheet(section_style)
+            ly.addWidget(lbl_section)
+
+            sep = QLabel('─' * 55)
+            sep.setStyleSheet(sep_style)
+            ly.addWidget(sep)
+
+            for key, desc in rows:
+                row_widget = QWidget()
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(4, 1, 4, 1)
+                row_layout.setSpacing(8)
+
+                lbl_key  = QLabel(key)
+                lbl_key.setStyleSheet(row_key_style)
+                lbl_desc = QLabel(desc)
+                lbl_desc.setStyleSheet(row_desc_style)
+
+                row_layout.addWidget(lbl_key)
+                row_layout.addWidget(lbl_desc)
+                row_layout.addStretch()
+                ly.addWidget(row_widget)
+
+        ly.addSpacing(12)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dlg.accept)
+        ly.addWidget(buttons)
+
+        dlg.exec()

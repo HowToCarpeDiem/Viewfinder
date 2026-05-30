@@ -449,7 +449,8 @@ class ImagePanel(QScrollArea):
         super().__init__(parent)
 
         self.scale_factor = 1.0
-        self._img_bgr = None
+        self._img_bgr      = None
+        self._pixmap_cache = None   # QPixmap at native image resolution; None = needs rebuild
 
         self.lb_image = InteractiveLabel()
         self.lb_image.setAlignment(Qt.AlignCenter)
@@ -463,19 +464,22 @@ class ImagePanel(QScrollArea):
 
     def set_image(self, img):
         """Display a new image (BGR or BGRA) and reset zoom to 1.0."""
-        self._img_bgr = img
-        self.scale_factor = 1.0
+        self._img_bgr      = img
+        self._pixmap_cache = None   # image changed — rebuild display cache
+        self.scale_factor  = 1.0
         self._render()
 
 
     def update_image(self, img):
         """Replace the displayed image (BGR or BGRA) without changing the current zoom level."""
-        self._img_bgr = img
+        self._img_bgr      = img
+        self._pixmap_cache = None   # image changed — rebuild display cache
         self._render()
 
 
     def refresh(self):
-        """Re-render the current image (useful after an in-place edit)."""
+        """Re-render the current image after an in-place edit (img_current modified externally)."""
+        self._pixmap_cache = None   # content changed in-place — rebuild display cache
         self._render()
 
 
@@ -511,25 +515,34 @@ class ImagePanel(QScrollArea):
         if self._img_bgr is None:
             return
 
-        img = self._img_bgr
-        if img.ndim == 3 and img.shape[2] == 4:
-            # BGRA — composite over a checkerboard so transparency is visible
-            img_display = self._composite_on_checker(img)
-            h, w = img_display.shape[:2]
-            q_img = QImage(img_display.data, w, h, w * 3, QImage.Format_RGB888)
-        else:
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            h, w = img_rgb.shape[:2]
-            q_img = QImage(img_rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        # Rebuild the display pixmap only when the image content has changed.
+        # This avoids re-running _composite_on_checker (expensive numpy float
+        # ops over the whole image) on every zoom or resize event.
+        if self._pixmap_cache is None:
+            img = self._img_bgr
+            if img.ndim == 3 and img.shape[2] == 4:
+                # BGRA — composite over a checkerboard so transparency is visible
+                rgb = self._composite_on_checker(img)
+            else:
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        pixmap = QPixmap.fromImage(q_img)
+            h, w = rgb.shape[:2]
+            # fromImage copies the pixel data, so the numpy array can be
+            # garbage-collected immediately after this line.
+            self._pixmap_cache = QPixmap.fromImage(
+                QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+            )
 
+        # Qt scales the cached QPixmap — this is a lightweight GPU-backed
+        # operation and is safe to call on every zoom / resize event.
         vp_w = max(1, self.viewport().width())
         vp_h = max(1, self.viewport().height())
         target_w = int(vp_w * self.scale_factor)
         target_h = int(vp_h * self.scale_factor)
 
-        scaled = pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled = self._pixmap_cache.scaled(
+            target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
         self.lb_image.setPixmap(scaled)
         self.lb_image.adjustSize()
 

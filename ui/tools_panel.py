@@ -62,7 +62,8 @@ class ToolsPanel(QWidget):
     contrast_requested   = Signal()
     saturation_requested = Signal()
     blur_requested       = Signal()
-    active_tool_changed  = Signal(str)   # 'adjustments' | 'blur' | 'none'
+    transform_requested  = Signal(str)   # 'flip_h' | 'flip_v' | 'rotate_cw' | 'rotate_ccw' | 'rotate_180'
+    active_tool_changed  = Signal(str)   # 'adjustments' | 'blur' | 'transform' | 'none'
 
     # ROI signals
     roi_mode_changed = Signal(str)   # 'rectangle' | 'circle' | 'polygon' | 'brush' | 'none'
@@ -91,6 +92,13 @@ class ToolsPanel(QWidget):
         self.btn_blur.setCheckable(True)
         self.btn_blur.setStyleSheet(_BTN_STYLE)
         ly_tools.addWidget(self.btn_blur)
+
+        self.btn_transform = QPushButton()
+        self.btn_transform.setIcon(QIcon('assets/transform.png'))
+        self.btn_transform.setToolTip('Transform  (flip / rotate)')
+        self.btn_transform.setCheckable(True)
+        self.btn_transform.setStyleSheet(_BTN_STYLE)
+        ly_tools.addWidget(self.btn_transform)
 
         ly_tools.addStretch()
 
@@ -218,17 +226,60 @@ class ToolsPanel(QWidget):
         ly_blur.addStretch()
         self.tool_options.addWidget(self._page_blur)
 
+        # Transform page
+        self._page_transform = QWidget()
+        ly_tr = QVBoxLayout(self._page_transform)
+        ly_tr.setSpacing(6)
+        ly_tr.setContentsMargins(2, 4, 2, 4)
+
+        ly_tr.addWidget(QLabel('Flip:'))
+        ly_flip = QHBoxLayout()
+        self.btn_flip_h = QPushButton('↔  Horizontal')
+        self.btn_flip_h.setToolTip('Mirror left ↔ right')
+        self.btn_flip_v = QPushButton('↕  Vertical')
+        self.btn_flip_v.setToolTip('Mirror top ↕ bottom')
+        ly_flip.addWidget(self.btn_flip_h)
+        ly_flip.addWidget(self.btn_flip_v)
+        ly_tr.addLayout(ly_flip)
+
+        ly_tr.addSpacing(4)
+        ly_tr.addWidget(QLabel('Rotate:'))
+
+        ly_rot1 = QHBoxLayout()
+        self.btn_rotate_ccw = QPushButton('↺  90° CCW')
+        self.btn_rotate_ccw.setToolTip('Rotate 90° counter-clockwise')
+        self.btn_rotate_cw  = QPushButton('↻  90° CW')
+        self.btn_rotate_cw.setToolTip('Rotate 90° clockwise')
+        ly_rot1.addWidget(self.btn_rotate_ccw)
+        ly_rot1.addWidget(self.btn_rotate_cw)
+        ly_tr.addLayout(ly_rot1)
+
+        self.btn_rotate_180 = QPushButton('⇄  180°')
+        self.btn_rotate_180.setToolTip('Rotate 180°')
+        ly_tr.addWidget(self.btn_rotate_180)
+
+        ly_tr.addStretch()
+        self.tool_options.addWidget(self._page_transform)
+
         # Signal connections
         self.btn_adjustments.clicked.connect(
             lambda: self._on_tool_clicked(self.btn_adjustments, 'adjustments'))
         self.btn_blur.clicked.connect(
             lambda: self._on_tool_clicked(self.btn_blur, 'blur'))
+        self.btn_transform.clicked.connect(
+            lambda: self._on_tool_clicked(self.btn_transform, 'transform'))
 
         self.btn_apply_brightness.clicked.connect(self.brightness_requested)
         self.btn_apply_contrast.clicked.connect(self.contrast_requested)
         self.btn_apply_saturation.clicked.connect(self.saturation_requested)
         self.btn_apply_grayscale.clicked.connect(self.grayscale_requested)
         self.btn_apply_blur.clicked.connect(self.blur_requested)
+
+        self.btn_flip_h.clicked.connect(lambda: self.transform_requested.emit('flip_h'))
+        self.btn_flip_v.clicked.connect(lambda: self.transform_requested.emit('flip_v'))
+        self.btn_rotate_cw.clicked.connect(lambda: self.transform_requested.emit('rotate_cw'))
+        self.btn_rotate_ccw.clicked.connect(lambda: self.transform_requested.emit('rotate_ccw'))
+        self.btn_rotate_180.clicked.connect(lambda: self.transform_requested.emit('rotate_180'))
 
         self.btn_roi_rect.clicked.connect(
             lambda: self._on_roi_clicked(self.btn_roi_rect, 'rectangle'))
@@ -245,7 +296,7 @@ class ToolsPanel(QWidget):
         ROI section is independent and not affected by tool switching."""
         is_now_checked = clicked_btn.isChecked()
 
-        for btn in (self.btn_adjustments, self.btn_blur):
+        for btn in (self.btn_adjustments, self.btn_blur, self.btn_transform):
             if btn is not clicked_btn:
                 btn.setChecked(False)
 
@@ -254,6 +305,8 @@ class ToolsPanel(QWidget):
                 self.tool_options.setCurrentWidget(self._page_adjustments)
             elif tool_name == 'blur':
                 self.tool_options.setCurrentWidget(self._page_blur)
+            elif tool_name == 'transform':
+                self.tool_options.setCurrentWidget(self._page_transform)
             self.active_tool_changed.emit(tool_name)
         else:
             self.tool_options.setCurrentWidget(self._page_default)
