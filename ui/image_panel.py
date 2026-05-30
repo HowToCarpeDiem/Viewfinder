@@ -445,6 +445,10 @@ class ImagePanel(QScrollArea):
     ZOOM_MIN  = 0.1
     ZOOM_MAX  = 5.0
 
+    # Emitted every time the display is refreshed (zoom, resize, new image).
+    # Connect to this to keep external info panels in sync.
+    render_done = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -489,14 +493,54 @@ class ImagePanel(QScrollArea):
 
 
     def wheelEvent(self, event):
-        if event.modifiers() == Qt.ControlModifier:
-            if event.angleDelta().y() > 0:
-                self.scale_factor = min(self.scale_factor + self.ZOOM_STEP, self.ZOOM_MAX)
-            else:
-                self.scale_factor = max(self.scale_factor - self.ZOOM_STEP, self.ZOOM_MIN)
-            self._render()
-        else:
+        if event.modifiers() != Qt.ControlModifier:
             super().wheelEvent(event)
+            return
+
+        # ── Zoom-to-cursor ────────────────────────────────────────────────────
+        # 1. Record where in the pixmap the cursor currently points.
+        pm_before = self.lb_image.pixmap()
+        cursor_vp = event.position().toPoint()   # cursor in viewport coords
+
+        if pm_before is not None and pm_before.width() > 0:
+            # Position of lb_image's top-left corner inside the viewport.
+            # When the pixmap fits the viewport it is centred (Qt.AlignCenter);
+            # when it overflows the scrollbars shift it.
+            lb_w = self.lb_image.width()
+            lb_h = self.lb_image.height()
+            vp_w = self.viewport().width()
+            vp_h = self.viewport().height()
+
+            lb_x_in_vp = (vp_w - lb_w) // 2 if lb_w <= vp_w else -self.horizontalScrollBar().value()
+            lb_y_in_vp = (vp_h - lb_h) // 2 if lb_h <= vp_h else -self.verticalScrollBar().value()
+
+            # Fractional position of cursor within the pixmap (clamped to [0,1])
+            frac_x = (cursor_vp.x() - lb_x_in_vp) / pm_before.width()
+            frac_y = (cursor_vp.y() - lb_y_in_vp) / pm_before.height()
+        else:
+            frac_x = frac_y = 0.5   # no image yet — zoom towards centre
+
+        # 2. Apply the new scale.
+        if event.angleDelta().y() > 0:
+            self.scale_factor = min(self.scale_factor + self.ZOOM_STEP, self.ZOOM_MAX)
+        else:
+            self.scale_factor = max(self.scale_factor - self.ZOOM_STEP, self.ZOOM_MIN)
+
+        self._render()   # lb_image now has its new size
+
+        # 3. Adjust scroll bars so the same image point stays under the cursor.
+        pm_after = self.lb_image.pixmap()
+        if pm_after is None or pm_after.width() == 0:
+            return
+
+        # Desired position of the anchor point in the new pixmap (px coords)
+        target_x = frac_x * pm_after.width()
+        target_y = frac_y * pm_after.height()
+
+        # scroll = anchor_in_lb - cursor_in_viewport
+        # Qt clamps setValue() to [minimum, maximum] automatically.
+        self.horizontalScrollBar().setValue(int(target_x - cursor_vp.x()))
+        self.verticalScrollBar().setValue(int(target_y - cursor_vp.y()))
 
 
     def resizeEvent(self, event):
@@ -545,6 +589,53 @@ class ImagePanel(QScrollArea):
         )
         self.lb_image.setPixmap(scaled)
         self.lb_image.adjustSize()
+        self.render_done.emit()
+
+
+    def get_viewport_image_coords(self):
+        """Return (x0, y0, x1, y1): the image-pixel coordinates of the
+        top-left and bottom-right corners of the currently visible viewport.
+
+        Returns None when no image is loaded.
+
+        The calculation accounts for centering (when the pixmap is smaller
+        than the viewport Qt centres it and the scroll bars are at 0).
+        """
+        pm = self.lb_image.pixmap()
+        if pm is None or self._img_bgr is None:
+            return None
+
+        pm_w, pm_h = pm.width(), pm.height()
+        if pm_w == 0 or pm_h == 0:
+            return None
+
+        vp_w = self.viewport().width()
+        vp_h = self.viewport().height()
+        h_scroll = self.horizontalScrollBar().value()
+        v_scroll = self.verticalScrollBar().value()
+
+        # When the pixmap fits inside the viewport it is centred;
+        # the whole pixmap is visible and scroll values are meaningless.
+        if pm_w <= vp_w:
+            x0_px, x1_px = 0, pm_w
+        else:
+            x0_px = h_scroll
+            x1_px = min(h_scroll + vp_w, pm_w)
+
+        if pm_h <= vp_h:
+            y0_px, y1_px = 0, pm_h
+        else:
+            y0_px = v_scroll
+            y1_px = min(v_scroll + vp_h, pm_h)
+
+        img_h, img_w = self._img_bgr.shape[:2]
+        rx = img_w / pm_w
+        ry = img_h / pm_h
+
+        return (
+            int(x0_px * rx), int(y0_px * ry),
+            int(x1_px * rx), int(y1_px * ry),
+        )
 
 
     @staticmethod

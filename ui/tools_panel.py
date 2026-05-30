@@ -158,6 +158,26 @@ class ToolsPanel(QWidget):
 
         ly_main.addStretch()
 
+        # Image info panel — pinned to the bottom of the tools column
+        sep_info = QFrame()
+        sep_info.setFrameShape(QFrame.HLine)
+        sep_info.setFrameShadow(QFrame.Sunken)
+        ly_main.addWidget(sep_info)
+
+        _info_style = 'color: #555; font-size: 10px; font-family: monospace;'
+
+        self.lbl_resolution = QLabel('No image')
+        self.lbl_resolution.setStyleSheet(_info_style)
+        ly_main.addWidget(self.lbl_resolution)
+
+        self.lbl_viewport_tl = QLabel('')
+        self.lbl_viewport_tl.setStyleSheet(_info_style)
+        ly_main.addWidget(self.lbl_viewport_tl)
+
+        self.lbl_viewport_br = QLabel('')
+        self.lbl_viewport_br.setStyleSheet(_info_style)
+        ly_main.addWidget(self.lbl_viewport_br)
+
         # Default (empty) page
         self._page_default = QWidget()
         ly_default = QVBoxLayout(self._page_default)
@@ -355,3 +375,28 @@ class ToolsPanel(QWidget):
     def get_brush_size(self) -> int:
         """Return current brush radius in display pixels."""
         return self.slider_brush_size.value()
+
+
+    def set_image_info(self, resolution, coords):
+        """Update the image info panel at the bottom of the tools column.
+
+        resolution  (width, height) tuple in pixels, or None when no image.
+        coords      (x0, y0, x1, y1) image-pixel coordinates of the visible
+                    viewport corners (top-left and bottom-right), or None.
+        """
+        if resolution is None:
+            self.lbl_resolution.setText('No image')
+            self.lbl_viewport_tl.setText('')
+            self.lbl_viewport_br.setText('')
+            return
+
+        w, h = resolution
+        self.lbl_resolution.setText(f'{w} x {h} px')
+
+        if coords is not None:
+            x0, y0, x1, y1 = coords
+            self.lbl_viewport_tl.setText(f'TL  ({x0}, {y0})')
+            self.lbl_viewport_br.setText(f'BR  ({x1}, {y1})')
+        else:
+            self.lbl_viewport_tl.setText('')
+            self.lbl_viewport_br.setText('')

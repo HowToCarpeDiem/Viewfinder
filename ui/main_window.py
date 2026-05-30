@@ -112,6 +112,11 @@ class MainWindow(QMainWindow):
         # Keep brush cursor size in sync with the slider
         self.tools_panel.slider_brush_size.valueChanged.connect(self._sync_brush_radius)
 
+        # Image info panel — update on zoom/resize (render_done) and on pan (scrollbars)
+        self.image_panel.render_done.connect(self._update_image_info)
+        self.image_panel.horizontalScrollBar().valueChanged.connect(self._update_image_info)
+        self.image_panel.verticalScrollBar().valueChanged.connect(self._update_image_info)
+
         self.dir_panel.file_selected.connect(self.load_image_from_path)
 
 
@@ -224,6 +229,20 @@ class MainWindow(QMainWindow):
     def _sync_brush_radius(self):
         """Copy the current brush-size slider value to InteractiveLabel."""
         self.image_panel.lb_image._brush_radius = self.tools_panel.get_brush_size()
+
+
+    def _update_image_info(self):
+        """Refresh the image info panel (resolution + visible viewport coords).
+
+        Called whenever the display changes: zoom, resize, pan, or new image.
+        """
+        if self.img_current is None:
+            self.tools_panel.set_image_info(None, None)
+            return
+
+        h, w = self.img_current.shape[:2]
+        coords = self.image_panel.get_viewport_image_coords()
+        self.tools_panel.set_image_info((w, h), coords)
 
 
     #ROI / Selection management 
