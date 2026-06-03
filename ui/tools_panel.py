@@ -57,10 +57,11 @@ class ToolsPanel(QWidget):
     options at the bottom."""
 
     # Tool-level signals
-    grayscale_requested  = Signal()
-    brightness_requested = Signal()
-    contrast_requested   = Signal()
-    saturation_requested = Signal()
+    grayscale_requested  = Signal()       # Grayscale button clicked
+    adj_session_start    = Signal()       # any adjustment slider grabbed (sliderPressed)
+    brightness_live      = Signal(int)    # brightness slider valueChanged
+    contrast_live        = Signal(int)    # contrast slider valueChanged
+    saturation_live      = Signal(int)    # saturation slider valueChanged
     blur_requested       = Signal()
     transform_requested  = Signal(str)   # 'flip_h' | 'flip_v' | 'rotate_cw' | 'rotate_ccw' | 'rotate_180'
     active_tool_changed  = Signal(str)   # 'adjustments' | 'blur' | 'transform' | 'none'
@@ -192,22 +193,16 @@ class ToolsPanel(QWidget):
 
         # Brightness
         self.slider_brightness, _ = _make_slider_row(ly_adj, 'Brightness:', -100, 100, 0)
-        self.btn_apply_brightness = QPushButton('Apply Brightness')
-        ly_adj.addWidget(self.btn_apply_brightness)
 
         ly_adj.addSpacing(6)
 
         # Contrast
         self.slider_contrast, _ = _make_slider_row(ly_adj, 'Contrast:', -100, 100, 0)
-        self.btn_apply_contrast = QPushButton('Apply Contrast')
-        ly_adj.addWidget(self.btn_apply_contrast)
 
         ly_adj.addSpacing(6)
 
         # Saturation
         self.slider_saturation, _ = _make_slider_row(ly_adj, 'Saturation:', -100, 100, 0)
-        self.btn_apply_saturation = QPushButton('Apply Saturation')
-        ly_adj.addWidget(self.btn_apply_saturation)
 
         ly_adj.addSpacing(6)
 
@@ -217,9 +212,9 @@ class ToolsPanel(QWidget):
         sep_gray.setFrameShadow(QFrame.Sunken)
         ly_adj.addWidget(sep_gray)
 
-        # Grayscale (no slider needed)
-        self.btn_apply_grayscale = QPushButton('Apply Grayscale')
-        ly_adj.addWidget(self.btn_apply_grayscale)
+        # Grayscale — one-click conversion, no slider needed
+        self.btn_grayscale = QPushButton('Grayscale')
+        ly_adj.addWidget(self.btn_grayscale)
 
         ly_adj.addStretch()
         self.tool_options.addWidget(self._page_adjustments)
@@ -289,10 +284,15 @@ class ToolsPanel(QWidget):
         self.btn_transform.clicked.connect(
             lambda: self._on_tool_clicked(self.btn_transform, 'transform'))
 
-        self.btn_apply_brightness.clicked.connect(self.brightness_requested)
-        self.btn_apply_contrast.clicked.connect(self.contrast_requested)
-        self.btn_apply_saturation.clicked.connect(self.saturation_requested)
-        self.btn_apply_grayscale.clicked.connect(self.grayscale_requested)
+        # Live adjustment sliders: sliderPressed starts a session, valueChanged streams the value
+        for sl, sig in (
+            (self.slider_brightness, self.brightness_live),
+            (self.slider_contrast,   self.contrast_live),
+            (self.slider_saturation, self.saturation_live),
+        ):
+            sl.sliderPressed.connect(self.adj_session_start)
+            sl.valueChanged.connect(sig)
+        self.btn_grayscale.clicked.connect(self.grayscale_requested)
         self.btn_apply_blur.clicked.connect(self.blur_requested)
 
         self.btn_flip_h.clicked.connect(lambda: self.transform_requested.emit('flip_h'))
@@ -400,3 +400,17 @@ class ToolsPanel(QWidget):
         else:
             self.lbl_viewport_tl.setText('')
             self.lbl_viewport_br.setText('')
+
+
+    def reset_adjustment_sliders(self):
+        """Reset brightness, contrast and saturation sliders to 0.
+
+        Called whenever a new selection is committed or the current selection
+        is cleared, so each new region starts with neutral slider values.
+
+        Programmatic setValue() does NOT fire sliderPressed, so no adjustment
+        session is opened.  The valueChanged signal does fire, but the live
+        handlers return immediately because _adj_base is None at that point.
+        """
+        for sl in (self.slider_brightness, self.slider_contrast, self.slider_saturation):
+            sl.setValue(0)

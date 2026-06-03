@@ -22,8 +22,9 @@ class InteractiveLabel(QLabel):
     roi_circle_selected  = Signal(int, int, int)         # cx, cy, radius
     roi_polygon_selected = Signal(object)                # list of (x, y) tuples
     brush_stroke         = Signal(int, int, bool)        # x, y, is_first_point
+    roi_move_delta       = Signal(int, int)              # dx, dy in display pixels (Ctrl+RMB drag)
 
-    pan_delta = Signal(int, int)   
+    pan_delta = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -55,10 +56,11 @@ class InteractiveLabel(QLabel):
         # so the outline stays correct after zoom changes.
         self._committed_roi_norm = None
 
-        # RMB panning state
+        # RMB panning / ROI-move state
         self._pan_last         = QPoint()
         self._pan_press_global = QPoint()  # global pos at the moment of RMB press
         self._pan_did_drag     = False     # True once the pointer moves beyond the click threshold
+        self._roi_move_mode    = False     # True when Ctrl is held at RMB press
 
 
     def set_draw_mode(self, mode):
@@ -91,6 +93,8 @@ class InteractiveLabel(QLabel):
             self._pan_press_global = g
             self._pan_last         = g
             self._pan_did_drag     = False
+            # Ctrl+RMB → ROI move mode;  plain RMB → viewport pan
+            self._roi_move_mode = bool(event.modifiers() & Qt.ControlModifier)
             return
 
         if event.button() != Qt.LeftButton or self.draw_mode is None:
@@ -128,14 +132,17 @@ class InteractiveLabel(QLabel):
                 diff = current - self._pan_press_global
                 if abs(diff.x()) > 5 or abs(diff.y()) > 5:
                     self._pan_did_drag = True
-                    self._pan_last = current   # anchor to avoid a jump on first pan delta
-                    self.setCursor(Qt.ClosedHandCursor)
+                    self._pan_last = current   # anchor to avoid a jump on first delta
+                    self.setCursor(
+                        Qt.SizeAllCursor if self._roi_move_mode else Qt.ClosedHandCursor
+                    )
             if self._pan_did_drag:
-                # Use global coords — local coords shift when the scroll area scrolls,
-                # which would corrupt the delta and cause visible jitter.
                 delta = current - self._pan_last
                 self._pan_last = current
-                self.pan_delta.emit(delta.x(), delta.y())
+                if self._roi_move_mode:
+                    self.roi_move_delta.emit(delta.x(), delta.y())
+                else:
+                    self.pan_delta.emit(delta.x(), delta.y())
             return
 
         if self.draw_mode == 'rectangle' and self.is_drawing:
@@ -350,18 +357,36 @@ class InteractiveLabel(QLabel):
 
 
     def invert_roi_display(self):
-        """Toggle the 'inverted' flag on the committed ROI.
-
-        When inverted, _paint_committed_roi draws both the shape outline AND
-        the full-image border, visually conveying 'everything outside the
-        shape is selected'.  Calling this a second time restores the normal
-        (non-inverted) outline.
-        Has no effect if no committed ROI is currently displayed.
-        """
+        """Toggle the 'inverted' flag on the committed ROI."""
         if self._committed_roi_norm is not None:
             was = self._committed_roi_norm.get('inverted', False)
             self._committed_roi_norm['inverted'] = not was
             self.update()
+
+
+    def shift_committed_roi(self, dx_norm: float, dy_norm: float):
+        """Shift the committed ROI overlay by (dx_norm, dy_norm) in normalised
+        pixmap coordinates.
+
+        For rectangle:  x, y are offset.
+        For circle:     cx, cy are offset.
+        For polygon:    every vertex is offset.
+        For 'all':      no-op (the whole image cannot be moved).
+        """
+        n = self._committed_roi_norm
+        if n is None:
+            return
+        t = n['type']
+        if t == 'rectangle':
+            n['x'] += dx_norm
+            n['y'] += dy_norm
+        elif t == 'circle':
+            n['cx'] += dx_norm
+            n['cy'] += dy_norm
+        elif t == 'polygon':
+            n['pts'] = [(px + dx_norm, py + dy_norm) for px, py in n['pts']]
+        # 'all' type — entire image, moving makes no sense
+        self.update()
 
 
     def _paint_committed_roi(self, painter: QPainter):

@@ -26,6 +26,7 @@ class MainWindow(QMainWindow):
         self.img_current   = None   # always a BGR numpy array
         self.history       = []     # undo stack — list of img_current copies
         self.redo_stack    = []     # redo stack — filled by undo, cleared by any edit
+        self._adj_base     = None   # snapshot taken at the start of a live slider session
         self.image_list    = []     # flat list of image paths (arrow navigation)
         self.current_index = -1
         self.roi_mask           = None   # np.ndarray (H, W) uint8 or None (= whole image)
@@ -95,9 +96,17 @@ class MainWindow(QMainWindow):
 
         # Signal connections — tools panel
         self.tools_panel.grayscale_requested.connect(self.apply_grayscale)
-        self.tools_panel.brightness_requested.connect(self.apply_brightness)
-        self.tools_panel.contrast_requested.connect(self.apply_contrast)
-        self.tools_panel.saturation_requested.connect(self.apply_saturation)
+        self.tools_panel.adj_session_start.connect(self._on_adj_session_start)
+        self.tools_panel.brightness_live.connect(self._on_brightness_live)
+        self.tools_panel.contrast_live.connect(self._on_contrast_live)
+        self.tools_panel.saturation_live.connect(self._on_saturation_live)
+        # End each slider session when the user releases the slider
+        for sl in (
+            self.tools_panel.slider_brightness,
+            self.tools_panel.slider_contrast,
+            self.tools_panel.slider_saturation,
+        ):
+            sl.sliderReleased.connect(self._on_adj_session_end)
         self.tools_panel.blur_requested.connect(self.apply_blur)
         self.tools_panel.transform_requested.connect(self.apply_transform)
         self.tools_panel.active_tool_changed.connect(self._on_tool_changed)
@@ -108,6 +117,7 @@ class MainWindow(QMainWindow):
         self.image_panel.lb_image.roi_circle_selected.connect(self._on_roi_circle_set)
         self.image_panel.lb_image.roi_polygon_selected.connect(self._on_roi_polygon_set)
         self.image_panel.lb_image.brush_stroke.connect(self._on_brush_stroke)
+        self.image_panel.lb_image.roi_move_delta.connect(self._on_roi_move)
 
         # Keep brush cursor size in sync with the slider
         self.tools_panel.slider_brush_size.valueChanged.connect(self._sync_brush_radius)
@@ -245,7 +255,47 @@ class MainWindow(QMainWindow):
         self.tools_panel.set_image_info((w, h), coords)
 
 
-    #ROI / Selection management 
+    def _on_roi_move(self, dx_display: int, dy_display: int):
+        """Ctrl+RMB drag: translate the active ROI mask and its visual overlay.
+
+        dx_display / dy_display are deltas in display (pixmap) pixels.
+        They are converted to image pixels using the current pixmap-to-image ratio.
+        The mask is shifted with cv2.warpAffine so there is no wrap-around —
+        pixels that leave the image boundary become unselected (0).
+        """
+        if self.roi_mask is None or self.img_current is None:
+            return
+
+        pm = self.image_panel.lb_image.pixmap()
+        if pm is None or pm.width() == 0 or pm.height() == 0:
+            return
+
+        img_h, img_w = self.img_current.shape[:2]
+        pm_w, pm_h   = pm.width(), pm.height()
+
+        # Convert display-pixel delta → image-pixel delta
+        dx_img = int(round(dx_display * img_w / pm_w))
+        dy_img = int(round(dy_display * img_h / pm_h))
+
+        if dx_img == 0 and dy_img == 0:
+            return
+
+        # Translate the mask (no wrap-around; out-of-bounds pixels become 0)
+        M = np.float32([[1, 0, dx_img], [0, 1, dy_img]])
+        self.roi_mask = cv2.warpAffine(
+            self.roi_mask, M, (img_w, img_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        # Shift the visual overlay in normalised coordinates
+        dx_norm = dx_display / pm_w
+        dy_norm = dy_display / pm_h
+        self.image_panel.lb_image.shift_committed_roi(dx_norm, dy_norm)
+
+
+    #ROI / Selection management
 
     def _on_roi_rect_set(self, x: int, y: int, w: int, h: int):
         """Convert a drawn rectangle into an active selection mask."""
@@ -326,6 +376,7 @@ class MainWindow(QMainWindow):
         else:
             status = 'Custom'
         self.tools_panel.set_roi_status(status)
+        self.tools_panel.reset_adjustment_sliders()
 
 
     def _clear_roi(self):
@@ -333,6 +384,7 @@ class MainWindow(QMainWindow):
         self.roi_mask = None
         self.image_panel.lb_image.clear_roi_display()
         self.tools_panel.set_roi_status('None')
+        self.tools_panel.reset_adjustment_sliders()
         # Also exit the current ROI drawing mode and uncheck all shape buttons
         self.tools_panel._deactivate_roi_buttons()
 
@@ -421,6 +473,66 @@ class MainWindow(QMainWindow):
         Write operations on the returned slice propagate back to img_current.
         """
         return self.img_current[:, :, :3]
+
+
+    # Live adjustment helpers
+
+    def _on_adj_session_start(self):
+        """Called when any adjustment slider is first grabbed (sliderPressed).
+
+        Saves a snapshot of the current image as the base for this editing
+        session and pushes one undo entry.  If a session is already open
+        (e.g. user grabbed two sliders simultaneously) the second press is
+        ignored so history is only pushed once.
+        """
+        if self.img_current is None or self._adj_base is not None:
+            return
+        self._push_history()
+        self._adj_base = self.img_current.copy()
+
+    def _on_adj_session_end(self):
+        """Called when an adjustment slider is released — closes the session."""
+        self._adj_base = None
+
+    def _on_brightness_live(self, value: int):
+        """Apply brightness offset to _adj_base and stream to display."""
+        if self._adj_base is None or self.img_current is None:
+            return
+        result  = self._adj_base.copy()
+        bgr     = result[:, :, :3]
+        mask    = self._get_active_mask()
+        adjusted = np.clip(bgr.astype(np.int16) + value, 0, 255).astype(np.uint8)
+        bgr[mask == 255] = adjusted[mask == 255]
+        self.img_current = result
+        self.image_panel.update_image(result)
+
+    def _on_contrast_live(self, value: int):
+        """Apply contrast scaling to _adj_base and stream to display."""
+        if self._adj_base is None or self.img_current is None:
+            return
+        result  = self._adj_base.copy()
+        bgr     = result[:, :, :3]
+        mask    = self._get_active_mask()
+        alpha_f = 1.0 + value / 100.0
+        adjusted = cv2.convertScaleAbs(bgr, alpha=alpha_f, beta=0)
+        bgr[mask == 255] = adjusted[mask == 255]
+        self.img_current = result
+        self.image_panel.update_image(result)
+
+    def _on_saturation_live(self, value: int):
+        """Apply saturation scaling to _adj_base and stream to display."""
+        if self._adj_base is None or self.img_current is None:
+            return
+        result  = self._adj_base.copy()
+        bgr     = result[:, :, :3]
+        mask    = self._get_active_mask()
+        scale   = 1.0 + value / 100.0
+        img_hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * scale, 0, 255)
+        adjusted = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        bgr[mask == 255] = adjusted[mask == 255]
+        self.img_current = result
+        self.image_panel.update_image(result)
 
 
     def apply_grayscale(self):
