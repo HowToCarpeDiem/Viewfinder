@@ -33,6 +33,7 @@ class MainWindow(QMainWindow):
         self._active_tool       = 'none' # currently open tool: 'adjustments' | 'blur' | 'none'
         self._brush_blurred_ref = None   # precomputed blur reference for brush strokes
         self._brush_gray_ref    = None   # precomputed greyscale reference for brush strokes
+        self._levels_pre        = None   # snapshot taken before any Levels edit (for Reset)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -129,6 +130,12 @@ class MainWindow(QMainWindow):
 
         self.dir_panel.file_selected.connect(self.load_image_from_path)
 
+        # Histogram panel signals
+        hp = self.tools_panel.histogram_panel
+        hp.levels_preview.connect(self._on_levels_preview)
+        hp.levels_commit.connect(self._on_levels_commit)
+        hp.levels_reset.connect(self._on_levels_reset)
+
 
     def _build_menu(self):
         menu_bar  = self.menuBar()
@@ -191,6 +198,7 @@ class MainWindow(QMainWindow):
         self.img_current = img
         self.history.clear()
         self.redo_stack.clear()
+        self._levels_pre = None            # discard any open Levels session
         self._clear_roi()   # reset selection when switching to a new image
 
         if path in self.image_list:
@@ -199,6 +207,9 @@ class MainWindow(QMainWindow):
         self.image_panel.set_image(self.img_current)
         self.dir_panel.highlight_file(path)
         self._update_title(path)
+        # Refresh histogram and reset sliders for the new image
+        self.tools_panel.histogram_panel.reset_sliders()
+        self._refresh_histogram()
 
 
     def _navigate_if_not_tree(self, direction: int):
@@ -226,8 +237,24 @@ class MainWindow(QMainWindow):
 
 
     def _on_tool_changed(self, tool: str):
-        """Track the active tool so the brush knows which effect to paint."""
+        """Track the active tool so the brush knows which effect to paint.
+
+        Also manages adjustment and histogram session bases — each base is kept
+        alive for the entire duration that its tool panel is open so that all
+        slider movements within a session are measured from the SAME origin
+        (the image state at the moment the tool was first activated).
+        """
+        prev = self._active_tool
         self._active_tool = tool
+
+        # Leaving the Adjustments panel — close its session
+        if prev == 'adjustments' and tool != 'adjustments':
+            self._adj_base = None
+
+        # Leaving the Histogram panel — close its session
+        if prev == 'histogram' and tool != 'histogram':
+            self._levels_base = None
+            self._levels_pre  = None
 
 
     def _on_roi_mode_changed(self, mode: str):
@@ -377,6 +404,7 @@ class MainWindow(QMainWindow):
             status = 'Custom'
         self.tools_panel.set_roi_status(status)
         self.tools_panel.reset_adjustment_sliders()
+        self._on_roi_tool_session_refresh()
 
 
     def _clear_roi(self):
@@ -385,19 +413,52 @@ class MainWindow(QMainWindow):
         self.image_panel.lb_image.clear_roi_display()
         self.tools_panel.set_roi_status('None')
         self.tools_panel.reset_adjustment_sliders()
+        self._on_roi_tool_session_refresh()
         # Also exit the current ROI drawing mode and uncheck all shape buttons
         self.tools_panel._deactivate_roi_buttons()
 
 
+    def _on_roi_tool_session_refresh(self):
+        """Called whenever the active ROI selection changes (new ROI drawn or cleared).
+
+        When an Adjustments or Histogram session is open, the session base must
+        be advanced to the current img_current so that:
+
+        1. Edits committed to the PREVIOUS ROI are baked into the new base and
+           therefore preserved — subsequent work in the new ROI will not overwrite
+           them.
+        2. The sliders reset to their neutral positions so the user starts fresh
+           on the new selection (no leftover values from the previous region).
+        """
+        # ── Adjustments tool ─────────────────────────────────────────────────
+        if self._active_tool == 'adjustments' and self._adj_base is not None:
+            # Advance the base so brightness/contrast/saturation are relative
+            # to the image AFTER the previous ROI's edits.
+            self._adj_base = self.img_current.copy()
+            # Sliders are already reset to 0 by reset_adjustment_sliders() above.
+
+        # ── Histogram / Levels tool ───────────────────────────────────────────
+        if self._active_tool == 'histogram':
+            if self._levels_base is not None:
+                # Advance both the session base and the Reset reference so the
+                # Reset button reverts only the NEW ROI's edits, not the old ones.
+                self._levels_base = self.img_current.copy()
+                self._levels_pre  = self.img_current.copy()
+            # Reset slider handles to neutral for the new selection.
+            self.tools_panel.histogram_panel.reset_sliders()
+            # Refresh the histogram display to reflect the new selection area.
+            self._refresh_histogram()
+
     def _on_escape(self):
+
         """Esc key handler — two-stage behaviour:
         1. If a polygon is being drawn, cancel it (vertices cleared).
         2. Otherwise clear the committed selection entirely.
         """
         lb = self.image_panel.lb_image
-        if lb.draw_mode == 'polygon' and lb._polygon_pts_n:
-            lb._polygon_pts_n.clear()
-            lb._cursor_pos_n = None
+        if lb.draw_mode == 'polygon' and lb._polygon_points:
+            lb._polygon_points.clear()
+            lb._cursor_pos = None
             lb.update()
         else:
             self._clear_roi()
@@ -491,46 +552,69 @@ class MainWindow(QMainWindow):
         self._adj_base = self.img_current.copy()
 
     def _on_adj_session_end(self):
-        """Called when an adjustment slider is released — closes the session."""
-        self._adj_base = None
+        """Called when an adjustment slider is released.
+
+        Intentionally a no-op: the session base (_adj_base) should persist until
+        the Adjustments panel is closed so that a second drag on the same (or a
+        different) slider is still measured from the same original snapshot.
+        The base is cleared in _on_tool_changed when the user switches away.
+        """
 
     def _on_brightness_live(self, value: int):
-        """Apply brightness offset to _adj_base and stream to display."""
-        if self._adj_base is None or self.img_current is None:
-            return
-        result  = self._adj_base.copy()
-        bgr     = result[:, :, :3]
-        mask    = self._get_active_mask()
-        adjusted = np.clip(bgr.astype(np.int16) + value, 0, 255).astype(np.uint8)
-        bgr[mask == 255] = adjusted[mask == 255]
-        self.img_current = result
-        self.image_panel.update_image(result)
+        """Re-apply all adjustments from _adj_base with the new brightness value."""
+        self._apply_all_adjustments()
 
     def _on_contrast_live(self, value: int):
-        """Apply contrast scaling to _adj_base and stream to display."""
-        if self._adj_base is None or self.img_current is None:
-            return
-        result  = self._adj_base.copy()
-        bgr     = result[:, :, :3]
-        mask    = self._get_active_mask()
-        alpha_f = 1.0 + value / 100.0
-        adjusted = cv2.convertScaleAbs(bgr, alpha=alpha_f, beta=0)
-        bgr[mask == 255] = adjusted[mask == 255]
-        self.img_current = result
-        self.image_panel.update_image(result)
+        """Re-apply all adjustments from _adj_base with the new contrast value."""
+        self._apply_all_adjustments()
 
     def _on_saturation_live(self, value: int):
-        """Apply saturation scaling to _adj_base and stream to display."""
+        """Re-apply all adjustments from _adj_base with the new saturation value."""
+        self._apply_all_adjustments()
+
+
+    def _apply_all_adjustments(self):
+        """Apply the current brightness, contrast AND saturation slider values
+        jointly from _adj_base.
+
+        Because all three are re-computed from the same pristine snapshot every
+        time any one of them changes, there is no quality loss from repeated
+        remapping and the sliders behave independently (moving saturation to +20
+        and then back to 0 gives exactly the original brightness-adjusted image,
+        not a double-processed one).
+        """
         if self._adj_base is None or self.img_current is None:
             return
-        result  = self._adj_base.copy()
-        bgr     = result[:, :, :3]
-        mask    = self._get_active_mask()
-        scale   = 1.0 + value / 100.0
-        img_hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-        img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * scale, 0, 255)
-        adjusted = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-        bgr[mask == 255] = adjusted[mask == 255]
+
+        b = self.tools_panel.get_brightness()
+        c = self.tools_panel.get_contrast()
+        s = self.tools_panel.get_saturation()
+
+        result = self._adj_base.copy()
+        bgr    = result[:, :, :3]
+        mask   = self._get_active_mask()
+
+        # Work on a copy of the selected region so we can blend back via mask
+        work = bgr.copy()
+
+        # 1. Brightness  (additive)
+        if b != 0:
+            work = np.clip(work.astype(np.int16) + b, 0, 255).astype(np.uint8)
+
+        # 2. Contrast  (multiplicative around 0, then clamp)
+        if c != 0:
+            alpha_f = 1.0 + c / 100.0
+            work = cv2.convertScaleAbs(work, alpha=alpha_f, beta=0)
+
+        # 3. Saturation  (in HSV space)
+        if s != 0:
+            scale   = 1.0 + s / 100.0
+            img_hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV).astype(np.float32)
+            img_hsv[:, :, 1] = np.clip(img_hsv[:, :, 1] * scale, 0, 255)
+            work = cv2.cvtColor(img_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+        # Write the adjusted pixels only within the active mask
+        bgr[mask == 255] = work[mask == 255]
         self.img_current = result
         self.image_panel.update_image(result)
 
@@ -855,7 +939,129 @@ class MainWindow(QMainWindow):
         self.image_panel.set_image(self.img_current)
 
 
+    # ── Histogram / Levels ────────────────────────────────────────────────────
+
+    def _refresh_histogram(self):
+        """Recompute and display the histogram from img_current.
+
+        When a ROI selection is active the histogram is calculated only for the
+        selected pixels so the user sees the tonal distribution of the chosen
+        area, not the whole image.
+        """
+        self.tools_panel.histogram_panel.update_histogram(
+            self.img_current, self.roi_mask
+        )
+
+
+
+    def _on_levels_preview(self, channel: str, black: int, gamma: float, white: int):
+        """Apply all channel Levels from _levels_base during a slider drag.
+
+        On the very first drag within a session, _levels_pre and _levels_base are
+        saved once and history is pushed once.  Subsequent previews (including
+        other channels) re-apply ALL channels jointly from the same base so that
+        e.g. adjusting 'All black' and then 'Red gamma' does not stack on top of
+        an already-committed result — both are always relative to the session base.
+        """
+        if self.img_current is None:
+            return
+        if not hasattr(self, '_levels_base') or self._levels_base is None:
+            # First drag in this session — open it
+            self._levels_pre  = self.img_current.copy()
+            self._push_history()                      # push pre-session state once
+            self._levels_base = self.img_current.copy()
+        self.img_current = self._apply_all_levels()
+        self.image_panel.update_image(self.img_current)
+        self._refresh_histogram()
+
+    def _on_levels_commit(self, channel: str, black: int, gamma: float, white: int):
+        """User released a levels slider — finalise the result.
+
+        The session base (_levels_base) is intentionally kept alive so that
+        a subsequent drag on the same or a different channel slider still
+        computes from the original session snapshot, not from the committed state.
+        History was already pushed at session-open time in _on_levels_preview.
+        """
+        if self.img_current is None or self._levels_base is None:
+            return
+        self.img_current = self._apply_all_levels()
+        self.image_panel.update_image(self.img_current)
+        self._refresh_histogram()
+
+
+    def _on_levels_reset(self):
+        """Reset button: restore img_current to _levels_pre (the state before
+        any Levels edits in the current session) and reset slider positions."""
+        pre = getattr(self, '_levels_pre', None)
+        if pre is not None:
+            self.img_current  = pre.copy()
+            self._levels_base = None
+            self._levels_pre  = None
+            self.image_panel.update_image(self.img_current)
+            self._refresh_histogram()
+        # If _levels_pre is None no Levels edits have been made — nothing to revert.
+
+    def _apply_all_levels(self) -> np.ndarray:
+        """Apply ALL four channel Levels groups from _levels_base in one pass.
+
+        Reads the current slider values from HistogramPanel for every group
+        ('all', 'r', 'g', 'b') and chains them onto a fresh copy of the session
+        base.  Because every call starts from _levels_base (not from img_current),
+        each slider represents an ABSOLUTE offset from the session origin rather
+        than a cumulative one.
+
+        When a ROI selection is active the adjustments are blended back only
+        within the selected area — pixels outside the mask are unchanged.
+
+        Returns the processed ndarray (does not assign to self.img_current).
+        """
+        base   = self._levels_base
+        hp     = self.tools_panel.histogram_panel
+        result = base.copy()
+        for ch in ('all', 'r', 'g', 'b'):
+            b_val, g_val, w_val = hp.get_channel_levels(ch)
+            if b_val != 0 or g_val != 1.0 or w_val != 255:
+                result = self._apply_levels_lut(result, ch, b_val, g_val, w_val)
+
+        # If a selection is active, blend the adjusted pixels back into the
+        # base only where the mask is 255 — outside the ROI stays unchanged.
+        if self.roi_mask is not None:
+            final = base.copy()
+            final[self.roi_mask == 255] = result[self.roi_mask == 255]
+            return final
+
+        return result
+
+    def _apply_levels_lut(self, src: np.ndarray,
+
+                          channel: str,
+                          black: int, gamma: float, white: int) -> np.ndarray:
+        """Build a 256-entry LUT  [black … white] → [0 … 255] with gamma
+        correction and apply it to src.
+
+        channel: 'all'  → apply to all three BGR channels equally
+                 'r'    → apply to R channel only  (index 2 in BGR)
+                 'g'    → apply to G channel only  (index 1)
+                 'b'    → apply to B channel only  (index 0)
+
+        The alpha channel (index 3 in BGRA images) is left untouched.
+        """
+        lut  = np.arange(256, dtype=np.float32)
+        span = max(1, white - black)
+        lut  = np.clip((lut - black) / span, 0.0, 1.0)
+        if gamma != 1.0:
+            lut = lut ** (1.0 / gamma)
+        lut = np.clip(lut * 255.0, 0, 255).astype(np.uint8)
+
+        result   = src.copy()
+        ch_map   = {'r': [2], 'g': [1], 'b': [0], 'all': [0, 1, 2]}
+        channels = ch_map.get(channel, [0, 1, 2])
+        for c in channels:
+            result[:, :, c] = cv2.LUT(src[:, :, c], lut)
+        return result
+
     def save_image(self):
+
         if self.img_current is None:
             print('First, load an image.')
             return

@@ -5,6 +5,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, Signal
 
+from ui.histogram_panel import HistogramPanel
+
 
 _BTN_STYLE = """
 QPushButton {
@@ -100,6 +102,13 @@ class ToolsPanel(QWidget):
         self.btn_transform.setCheckable(True)
         self.btn_transform.setStyleSheet(_BTN_STYLE)
         ly_tools.addWidget(self.btn_transform)
+
+        self.btn_histogram = QPushButton()
+        self.btn_histogram.setIcon(QIcon('assets/histogram.png'))
+        self.btn_histogram.setToolTip('Histogram  (levels per channel)')
+        self.btn_histogram.setCheckable(True)
+        self.btn_histogram.setStyleSheet(_BTN_STYLE)
+        ly_tools.addWidget(self.btn_histogram)
 
         ly_tools.addStretch()
 
@@ -276,6 +285,15 @@ class ToolsPanel(QWidget):
         ly_tr.addStretch()
         self.tool_options.addWidget(self._page_transform)
 
+        # Histogram page — contains the full HistogramPanel widget
+        self._page_histogram = QWidget()
+        ly_hist = QVBoxLayout(self._page_histogram)
+        ly_hist.setContentsMargins(0, 0, 0, 0)
+        ly_hist.setSpacing(0)
+        self.histogram_panel = HistogramPanel()
+        ly_hist.addWidget(self.histogram_panel)
+        self.tool_options.addWidget(self._page_histogram)
+
         # Signal connections
         self.btn_adjustments.clicked.connect(
             lambda: self._on_tool_clicked(self.btn_adjustments, 'adjustments'))
@@ -283,6 +301,8 @@ class ToolsPanel(QWidget):
             lambda: self._on_tool_clicked(self.btn_blur, 'blur'))
         self.btn_transform.clicked.connect(
             lambda: self._on_tool_clicked(self.btn_transform, 'transform'))
+        self.btn_histogram.clicked.connect(
+            lambda: self._on_tool_clicked(self.btn_histogram, 'histogram'))
 
         # Live adjustment sliders: sliderPressed starts a session, valueChanged streams the value
         for sl, sig in (
@@ -316,7 +336,8 @@ class ToolsPanel(QWidget):
         ROI section is independent and not affected by tool switching."""
         is_now_checked = clicked_btn.isChecked()
 
-        for btn in (self.btn_adjustments, self.btn_blur, self.btn_transform):
+        for btn in (self.btn_adjustments, self.btn_blur,
+                    self.btn_transform, self.btn_histogram):
             if btn is not clicked_btn:
                 btn.setChecked(False)
 
@@ -327,6 +348,8 @@ class ToolsPanel(QWidget):
                 self.tool_options.setCurrentWidget(self._page_blur)
             elif tool_name == 'transform':
                 self.tool_options.setCurrentWidget(self._page_transform)
+            elif tool_name == 'histogram':
+                self.tool_options.setCurrentWidget(self._page_histogram)
             self.active_tool_changed.emit(tool_name)
         else:
             self.tool_options.setCurrentWidget(self._page_default)
