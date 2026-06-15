@@ -29,3 +29,9 @@ dependencies:
       - pyside6-addons==6.11.0
       - pyside6-essentials==6.11.0
       - shiboken6==6.11.0
+      # Face detection / recognition / clustering
+      - insightface
+      - onnxruntime          # CPU backend  (use onnxruntime-gpu for CUDA)
+      # - onnxruntime-gpu    # uncomment + remove onnxruntime above for GPU
+      - hdbscan
+      - scikit-learn

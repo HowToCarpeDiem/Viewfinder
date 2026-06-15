@@ -72,6 +72,44 @@ class DirectoryPanel(QWidget):
             self.tree.scrollToItem(item)
 
 
+    def filter_by_paths(self, paths: set):
+        """Dim all tree items except those whose path is in *paths*.
+
+        Matching image items are shown normally; non-matching image items
+        are shown in a lighter colour.  Directory items are not dimmed.
+        """
+        from PySide6.QtGui import QColor
+        dim_color    = QColor('#b0b0b0')
+        normal_color = QColor()          # default (invalid → inherits palette)
+
+        for path, item in self._path_to_item.items():
+            if not os.path.isfile(path):
+                continue   # directory item — leave untouched
+            is_match = path in paths
+            item.setForeground(0, normal_color if is_match else dim_color)
+            font = item.font(0)
+            font.setItalic(not is_match)
+            item.setFont(0, font)
+
+        # Scroll to first match
+        for path in sorted(paths):
+            item = self._path_to_item.get(path)
+            if item:
+                self.tree.scrollToItem(item)
+                break
+
+
+    def clear_filter(self):
+        """Remove any active filter — restore all items to normal appearance."""
+        from PySide6.QtGui import QColor
+        normal_color = QColor()
+        for item in self._path_to_item.values():
+            item.setForeground(0, normal_color)
+            font = item.font(0)
+            font.setItalic(False)
+            item.setFont(0, font)
+
+
     def _populate_tree(self, parent_item: QTreeWidgetItem, dir_path: str):
         """Recursively build tree items for a directory."""
         try:

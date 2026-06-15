@@ -403,7 +403,7 @@ class ToolsPanel(QWidget):
     def set_image_info(self, resolution, coords):
         """Update the image info panel at the bottom of the tools column.
 
-        resolution  (width, height) tuple in pixels, or None when no image.
+        resolution  (width, height) tuple in pixels, or None when no image.`
         coords      (x0, y0, x1, y1) image-pixel coordinates of the visible
                     viewport corners (top-left and bottom-right), or None.
         """
@@ -431,9 +431,13 @@ class ToolsPanel(QWidget):
         Called whenever a new selection is committed or the current selection
         is cleared, so each new region starts with neutral slider values.
 
-        Programmatic setValue() does NOT fire sliderPressed, so no adjustment
-        session is opened.  The valueChanged signal does fire, but the live
-        handlers return immediately because _adj_base is None at that point.
+        Signals are blocked during the reset so that valueChanged does NOT
+        fire _apply_all_adjustments() — which would revert img_current back
+        to _adj_base with all-zero values, discarding the user's edits.
         """
         for sl in (self.slider_brightness, self.slider_contrast, self.slider_saturation):
+            sl.blockSignals(True)
+        for sl in (self.slider_brightness, self.slider_contrast, self.slider_saturation):
             sl.setValue(0)
+        for sl in (self.slider_brightness, self.slider_contrast, self.slider_saturation):
+            sl.blockSignals(False)

@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt
 from ui.image_panel import ImagePanel
 from ui.tools_panel import ToolsPanel
 from ui.directory_panel import DirectoryPanel
+from ui.faces_panel import FacesPanel
 
 
 class MainWindow(QMainWindow):
@@ -27,13 +28,15 @@ class MainWindow(QMainWindow):
         self.history       = []     # undo stack — list of img_current copies
         self.redo_stack    = []     # redo stack — filled by undo, cleared by any edit
         self._adj_base     = None   # snapshot taken at the start of a live slider session
-        self.image_list    = []     # flat list of image paths (arrow navigation)
-        self.current_index = -1
+        self.image_list       = []   # flat list of image paths (arrow navigation)
+        self._filtered_paths  = None  # set[str] | None — active face-cluster filter
+        self.current_index    = -1
         self.roi_mask           = None   # np.ndarray (H, W) uint8 or None (= whole image)
         self._active_tool       = 'none' # currently open tool: 'adjustments' | 'blur' | 'none'
         self._brush_blurred_ref = None   # precomputed blur reference for brush strokes
         self._brush_gray_ref    = None   # precomputed greyscale reference for brush strokes
         self._levels_pre        = None   # snapshot taken before any Levels edit (for Reset)
+        self._levels_base       = None   # session base for Levels (initialised on first drag)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -47,8 +50,10 @@ class MainWindow(QMainWindow):
         self.tab_widget.setFixedWidth(220)
         self.tools_panel = ToolsPanel()
         self.dir_panel   = DirectoryPanel()
+        self.faces_panel = FacesPanel()
         self.tab_widget.addTab(self.tools_panel, 'Tools')
         self.tab_widget.addTab(self.dir_panel,   'Directory')
+        self.tab_widget.addTab(self.faces_panel, 'Faces')
         ly_main.addWidget(self.tab_widget)
 
         # Visual separator between the left panel and the image viewer
@@ -130,6 +135,10 @@ class MainWindow(QMainWindow):
 
         self.dir_panel.file_selected.connect(self.load_image_from_path)
 
+        # Signal connections — faces panel
+        self.faces_panel.cluster_selected.connect(self._on_cluster_selected)
+        self.faces_panel.cluster_cleared.connect(self._on_cluster_cleared)
+
         # Histogram panel signals
         hp = self.tools_panel.histogram_panel
         hp.levels_preview.connect(self._on_levels_preview)
@@ -184,6 +193,10 @@ class MainWindow(QMainWindow):
         self.dir_panel.load_directory(dir_path)
         self.tab_widget.setCurrentWidget(self.dir_panel)
 
+        # Pass image list to FacesPanel so it can analyse this directory
+        self.faces_panel.set_directory(self.image_list, dir_path)
+        self._filtered_paths = None   # clear any previous face filter
+
         if self.image_list:
             self.current_index = 0
             self.load_image_from_path(self.image_list[0])
@@ -220,10 +233,52 @@ class MainWindow(QMainWindow):
 
 
     def _navigate(self, direction: int):
-        if not self.image_list or self.current_index < 0:
+        """Step through images.
+
+        When a face-cluster filter is active the navigation is restricted
+        to the filtered subset so arrow keys browse only the relevant photos.
+        """
+        nav_list = (
+            [p for p in self.image_list if p in self._filtered_paths]
+            if self._filtered_paths is not None
+            else self.image_list
+        )
+        if not nav_list:
             return
-        self.current_index = (self.current_index + direction) % len(self.image_list)
-        self.load_image_from_path(self.image_list[self.current_index])
+
+        current_path = (
+            self.image_list[self.current_index]
+            if 0 <= self.current_index < len(self.image_list)
+            else None
+        )
+        if current_path in nav_list:
+            idx = nav_list.index(current_path)
+        else:
+            idx = 0
+
+        new_idx = (idx + direction) % len(nav_list)
+        self.load_image_from_path(nav_list[new_idx])
+
+
+    def _on_cluster_selected(self, paths: list):
+        """FacesPanel emitted cluster_selected — filter directory view."""
+        self._filtered_paths = set(paths)
+        self.dir_panel.filter_by_paths(self._filtered_paths)
+        self.tab_widget.setCurrentWidget(self.dir_panel)
+        # Jump to first image in the cluster if current image is not in it
+        current = (
+            self.image_list[self.current_index]
+            if 0 <= self.current_index < len(self.image_list)
+            else None
+        )
+        if current not in self._filtered_paths and paths:
+            self.load_image_from_path(paths[0])
+
+
+    def _on_cluster_cleared(self):
+        """FacesPanel deselected a cluster — restore full directory view."""
+        self._filtered_paths = None
+        self.dir_panel.clear_filter()
 
 
     def _update_title(self, path: str):
