@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QSlider, QStackedWidget, QFrame
+    QPushButton, QLabel, QSlider, QStackedWidget, QFrame,
+    QMenu, QWidgetAction
 )
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, Signal
@@ -119,7 +120,7 @@ class ToolsPanel(QWidget):
         ly_main.addWidget(sep_top)
 
         self.lbl_roi_status = QLabel('None')
-        self.lbl_roi_status.setStyleSheet('color: #666; font-size: 10px;')
+        self.lbl_roi_status.setStyleSheet('color: #ccc; font-size: 10px;')
         ly_main.addWidget(self.lbl_roi_status)
 
         ly_roi = QHBoxLayout()
@@ -154,6 +155,48 @@ class ToolsPanel(QWidget):
         self.btn_roi_brush.setStyleSheet(_BTN_STYLE)
         ly_roi.addWidget(self.btn_roi_brush)
 
+        self.btn_brush_menu = QPushButton('▾')
+        self.btn_brush_menu.setFixedWidth(14)
+        self.btn_brush_menu.setToolTip('Brush size')
+        self.btn_brush_menu.setStyleSheet("""
+            QPushButton {
+                border: 1px solid #c0c0c0;
+                border-radius: 3px;
+                padding: 0px 2px;
+                font-size: 9px;
+                background-color: transparent;
+            }
+            QPushButton:hover  { background-color: #dbe9f9; border-color: #88b4e0; }
+            QPushButton:pressed { background-color: #b3d4f5; }
+            QPushButton:disabled { color: #aaa; border-color: #ddd; }
+        """)
+        ly_roi.addWidget(self.btn_brush_menu)
+
+        # Brush size popup menu
+        self._brush_size_menu = QMenu(self)
+        _bsw = QWidget()
+        _bsw_ly = QVBoxLayout(_bsw)
+        _bsw_ly.setContentsMargins(8, 6, 8, 6)
+        _bsw_ly.setSpacing(4)
+        _bsw_header = QHBoxLayout()
+        _bsw_header.addWidget(QLabel('Brush size:'))
+        _bsw_header.addStretch()
+        self._lbl_brush_val = QLabel('20')
+        self._lbl_brush_val.setStyleSheet('min-width: 24px; color: #444; font-size: 10px;')
+        _bsw_header.addWidget(self._lbl_brush_val)
+        _bsw_ly.addLayout(_bsw_header)
+        self.slider_brush_size = QSlider(Qt.Horizontal)
+        self.slider_brush_size.setRange(5, 100)
+        self.slider_brush_size.setValue(20)
+        self.slider_brush_size.setMinimumWidth(140)
+        self.slider_brush_size.valueChanged.connect(
+            lambda v: self._lbl_brush_val.setText(str(v))
+        )
+        _bsw_ly.addWidget(self.slider_brush_size)
+        _brush_wa = QWidgetAction(self._brush_size_menu)
+        _brush_wa.setDefaultWidget(_bsw)
+        self._brush_size_menu.addAction(_brush_wa)
+
         ly_roi.addStretch()
         ly_main.addLayout(ly_roi)
 
@@ -174,7 +217,7 @@ class ToolsPanel(QWidget):
         sep_info.setFrameShadow(QFrame.Sunken)
         ly_main.addWidget(sep_info)
 
-        _info_style = 'color: #555; font-size: 10px; font-family: monospace;'
+        _info_style = 'color: #ccc; font-size: 10px; font-family: monospace;'
 
         self.lbl_resolution = QLabel('No image')
         self.lbl_resolution.setStyleSheet(_info_style)
@@ -238,12 +281,6 @@ class ToolsPanel(QWidget):
         self.slider_blur.setRange(1, 50)
         self.slider_blur.setValue(10)
         ly_blur.addWidget(self.slider_blur)
-
-        ly_blur.addWidget(QLabel('Brush size:'))
-        self.slider_brush_size = QSlider(Qt.Horizontal)
-        self.slider_brush_size.setRange(5, 100)
-        self.slider_brush_size.setValue(20)
-        ly_blur.addWidget(self.slider_brush_size)
 
         self.btn_apply_blur = QPushButton('Apply Blur')
         ly_blur.addWidget(self.btn_apply_blur)
@@ -329,6 +366,7 @@ class ToolsPanel(QWidget):
             lambda: self._on_roi_clicked(self.btn_roi_polygon, 'polygon'))
         self.btn_roi_brush.clicked.connect(
             lambda: self._on_roi_clicked(self.btn_roi_brush, 'brush'))
+        self.btn_brush_menu.clicked.connect(self._show_brush_menu)
 
 
     def _on_tool_clicked(self, clicked_btn: QPushButton, tool_name: str):
@@ -355,6 +393,14 @@ class ToolsPanel(QWidget):
             self.tool_options.setCurrentWidget(self._page_default)
             self.active_tool_changed.emit('none')
 
+        # Disable the brush when the histogram tool is active
+        brush_enabled = not (is_now_checked and tool_name == 'histogram')
+        self.btn_roi_brush.setEnabled(brush_enabled)
+        self.btn_brush_menu.setEnabled(brush_enabled)
+        if not brush_enabled and self.btn_roi_brush.isChecked():
+            self.btn_roi_brush.setChecked(False)
+            self.roi_mode_changed.emit('none')
+
 
     def _on_roi_clicked(self, clicked_btn: QPushButton, mode: str):
         """Handle a ROI/selection button click (checkable toggle with mutual exclusion)."""
@@ -365,6 +411,12 @@ class ToolsPanel(QWidget):
                 btn.setChecked(False)
 
         self.roi_mode_changed.emit(mode if is_now_checked else 'none')
+
+
+    def _show_brush_menu(self):
+        """Show the brush size popup below the arrow button."""
+        btn = self.btn_brush_menu
+        self._brush_size_menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
 
 
     def _deactivate_roi_buttons(self):
