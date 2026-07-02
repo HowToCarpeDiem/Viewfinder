@@ -35,6 +35,10 @@ _PROJECT_ROOT = Path(__file__).parent.parent
 _MODEL_DIR    = _PROJECT_ROOT / 'models' / 'buffalo_l'
 _REQUIRED_ONNX = {'det_10g.onnx', 'w600k_r50.onnx'}
 
+# Directory where all per-folder face databases are stored.
+# Kept inside the project so image folders stay clean.
+_DB_DIR = _PROJECT_ROOT / 'data' / 'face_caches'
+
 THUMB_SIZE = 84   # pixel side of each face thumbnail
 
 _BTN_STYLE = """
@@ -264,7 +268,18 @@ class FacesPanel(QWidget):
     def set_directory(self, image_paths: list[str], directory: str):
         """Called by MainWindow whenever a new directory is opened."""
         self._image_paths = image_paths
-        db_path = os.path.join(directory, '.viewfinder_faces.db')
+
+        # Store the database in the project's data/face_caches/ directory
+        # so that image folders stay clean and the DB is never accidentally
+        # moved / deleted together with the images.
+        # Each directory gets its own DB file named by a short SHA-1 hash
+        # of the absolute path, with the folder name as a readable prefix.
+        import hashlib
+        abs_dir  = str(Path(directory).resolve())
+        dir_hash = hashlib.sha1(abs_dir.encode('utf-8')).hexdigest()[:12]
+        dir_name = Path(directory).name
+        _DB_DIR.mkdir(parents=True, exist_ok=True)
+        db_path  = str(_DB_DIR / f'{dir_name}_{dir_hash}.db')
 
         if self._cache:
             self._cache.close()

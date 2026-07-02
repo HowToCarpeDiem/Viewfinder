@@ -13,7 +13,8 @@ class DirectoryPanel(QWidget):
     Emits file_selected(path) when the user double-clicks a file.
     """
 
-    file_selected = Signal(str)
+    file_selected   = Signal(str)   # emitted when user double-clicks an image file
+    folder_selected = Signal(str)   # emitted when user double-clicks a directory
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -54,13 +55,25 @@ class DirectoryPanel(QWidget):
 
 
     def get_all_images(self, root_path: str) -> list[str]:
-        """Return a flat, sorted list of all image paths under root_path (recursive)."""
-        images = []
-        for dirpath, dirnames, filenames in os.walk(root_path):
-            dirnames.sort(key=str.lower)
-            for fname in sorted(filenames, key=str.lower):
-                if os.path.splitext(fname)[1].lower() in IMAGE_EXTENSIONS:
-                    images.append(os.path.join(dirpath, fname))
+        """Return a sorted list of image files directly inside root_path.
+
+        Non-recursive — only files in the given directory are returned.
+        To navigate images in a subdirectory the user must click that
+        subdirectory in the tree, which calls load_directory on it.
+        """
+        try:
+            entries = os.scandir(root_path)
+        except OSError:
+            return []
+        images = sorted(
+            (
+                entry.path
+                for entry in entries
+                if entry.is_file()
+                and os.path.splitext(entry.name)[1].lower() in IMAGE_EXTENSIONS
+            ),
+            key=lambda p: os.path.basename(p).lower(),
+        )
         return images
 
 
@@ -138,6 +151,10 @@ class DirectoryPanel(QWidget):
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
         path = item.data(0, Qt.UserRole)
-        if path and os.path.isfile(path):
+        if not path:
+            return
+        if os.path.isdir(path):
+            self.folder_selected.emit(path)
+        elif os.path.isfile(path):
             if os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS:
                 self.file_selected.emit(path)

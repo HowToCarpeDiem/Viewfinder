@@ -1,19 +1,23 @@
 import os
+import shutil
+from pathlib import Path
 
 import cv2
 import numpy as np
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QFrame,
     QTabWidget, QFileDialog, QSizePolicy, QTreeWidget,
-    QDialog, QVBoxLayout, QLabel, QScrollArea, QDialogButtonBox
+    QDialog, QVBoxLayout, QLabel, QScrollArea, QDialogButtonBox,
+    QMessageBox
 )
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QFileSystemWatcher, QTimer
 
 from ui.image_panel import ImagePanel
 from ui.tools_panel import ToolsPanel
 from ui.directory_panel import DirectoryPanel
 from ui.faces_panel import FacesPanel
+from ui.sort_dialog import SortDialog, load_sort_config, save_sort_config
 
 
 class MainWindow(QMainWindow):
@@ -37,6 +41,13 @@ class MainWindow(QMainWindow):
         self._brush_gray_ref    = None   # precomputed greyscale reference for brush strokes
         self._levels_pre        = None   # snapshot taken before any Levels edit (for Reset)
         self._levels_base       = None   # session base for Levels (initialised on first drag)
+
+        # Sort / move configuration
+        _sort_cfg            = load_sort_config()
+        self._sort_slots     = _sort_cfg['slots']      # dict[str, str]  key → folder path
+        self._sort_move      = _sort_cfg['move_mode']  # True = move, False = copy
+        self._open_directory = ''  # root directory opened via Open Directory (tree root)
+        self._nav_directory  = ''  # active navigation directory (image_list source)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -100,6 +111,11 @@ class MainWindow(QMainWindow):
         self.shortcut_next = QShortcut(QKeySequence(Qt.Key_Right), self)
         self.shortcut_next.activated.connect(lambda: self._navigate_if_not_tree(1))
 
+        # Sort / move shortcuts: keys 1–0 send the current image to the assigned folder
+        for _k in '1234567890':
+            _sc = QShortcut(QKeySequence(_k), self)
+            _sc.activated.connect(lambda k=_k: self._on_sort_key(k))
+
         # Signal connections — tools panel
         self.tools_panel.grayscale_requested.connect(self.apply_grayscale)
         self.tools_panel.adj_session_start.connect(self._on_adj_session_start)
@@ -133,7 +149,8 @@ class MainWindow(QMainWindow):
         self.image_panel.horizontalScrollBar().valueChanged.connect(self._update_image_info)
         self.image_panel.verticalScrollBar().valueChanged.connect(self._update_image_info)
 
-        self.dir_panel.file_selected.connect(self.load_image_from_path)
+        self.dir_panel.file_selected.connect(self._on_tree_file_selected)
+        self.dir_panel.folder_selected.connect(self._on_tree_folder_selected)
 
         # Signal connections — faces panel
         self.faces_panel.cluster_selected.connect(self._on_cluster_selected)
@@ -144,6 +161,17 @@ class MainWindow(QMainWindow):
         hp.levels_preview.connect(self._on_levels_preview)
         hp.levels_commit.connect(self._on_levels_commit)
         hp.levels_reset.connect(self._on_levels_reset)
+
+        # File system watcher — auto-refresh the directory panel when
+        # the user moves / renames / deletes files outside the app.
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(self._on_dir_changed)
+
+        # Debounce timer: coalesce rapid FS events into a single refresh.
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(300)   # ms
+        self._refresh_timer.timeout.connect(self._refresh_directory_panel)
 
 
     def _build_menu(self):
@@ -167,6 +195,12 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self.save_image)
         file_menu.addAction(save_action)
 
+        sort_menu = menu_bar.addMenu('Sort')
+
+        sort_config_action = QAction('Configure destinations…', self)
+        sort_config_action.triggered.connect(self._show_sort_dialog)
+        sort_menu.addAction(sort_config_action)
+
         settings_menu = menu_bar.addMenu('Settings')
 
         shortcuts_action = QAction('Shortcuts', self)
@@ -189,9 +223,14 @@ class MainWindow(QMainWindow):
         if not dir_path:
             return
 
+        self._open_directory = dir_path
+        self._nav_directory  = dir_path
         self.image_list = self.dir_panel.get_all_images(dir_path)
         self.dir_panel.load_directory(dir_path)
         self.tab_widget.setCurrentWidget(self.dir_panel)
+
+        # Register directory (and all subdirectories) with the FS watcher
+        self._setup_fs_watcher(dir_path)
 
         # Pass image list to FacesPanel so it can analyse this directory
         self.faces_panel.set_directory(self.image_list, dir_path)
@@ -1174,6 +1213,9 @@ class MainWindow(QMainWindow):
                 ('Ctrl + Scroll',    'Zoom in / out'),
                 ('RMB drag',         'Pan image'),
             ]),
+            ('Sort', [
+                ('1 – 9,  0',        'Move / copy image to assigned folder'),
+            ]),
             ('Other', [
                 ('Ctrl+/',           'Show this shortcuts window'),
             ]),
@@ -1219,3 +1261,237 @@ class MainWindow(QMainWindow):
         ly.addWidget(buttons)
 
         dlg.exec()
+
+
+    # ── File system watcher ─────────────────────────────────────────────────────
+
+    def _setup_fs_watcher(self, root_path: str):
+        """Register root_path and all its subdirectories with the FS watcher.
+
+        Clears any previously watched paths first so switching directories
+        doesn't accumulate stale watchers.
+        """
+        # Remove all existing watched directories
+        current = self._fs_watcher.directories()
+        if current:
+            self._fs_watcher.removePaths(current)
+
+        # Collect root + every subdirectory (recursive)
+        paths: list[str] = [root_path]
+        for dirpath, dirnames, _ in os.walk(root_path):
+            dirnames.sort()  # deterministic order
+            for d in dirnames:
+                paths.append(os.path.join(dirpath, d))
+
+        self._fs_watcher.addPaths(paths)
+
+
+    def _on_dir_changed(self, changed_path: str):
+        """Slot called by QFileSystemWatcher when any watched directory changes.
+
+        Adds newly created subdirectories to the watcher so they are also
+        monitored, then starts the debounce timer to coalesce rapid events.
+        """
+        # Add any brand-new subdirectories to the watcher
+        if os.path.isdir(changed_path):
+            try:
+                for entry in os.scandir(changed_path):
+                    if entry.is_dir() and entry.path not in self._fs_watcher.directories():
+                        self._fs_watcher.addPath(entry.path)
+            except OSError:
+                pass
+
+        # (Re)start the debounce timer
+        self._refresh_timer.start()
+
+
+    def _refresh_directory_panel(self):
+        """Refresh the directory tree and image list after an external FS change.
+
+        Preserves the currently displayed image when it still exists;
+        navigates to the next available image when it has been removed.
+        """
+        if not self._open_directory or not os.path.isdir(self._open_directory):
+            return
+
+        # Remember which image was on screen
+        current_path = (
+            self.image_list[self.current_index]
+            if 0 <= self.current_index < len(self.image_list)
+            else None
+        )
+
+        # Rebuild the directory tree (keeps the root constant)
+        self.dir_panel.load_directory(self._open_directory)
+
+        # Rebuild the flat image list from the active navigation directory
+        nav = self._nav_directory or self._open_directory
+        self.image_list = self.dir_panel.get_all_images(nav)
+
+        if current_path and os.path.isfile(current_path):
+            # Image still exists — update its index and re-highlight it
+            if current_path in self.image_list:
+                self.current_index = self.image_list.index(current_path)
+            self.dir_panel.highlight_file(current_path)
+            self._update_title(current_path)
+        elif self.image_list:
+            # Current image was removed — show the nearest remaining one
+            new_idx = min(
+                max(self.current_index, 0),
+                len(self.image_list) - 1,
+            )
+            self.current_index = new_idx
+            self.load_image_from_path(self.image_list[new_idx])
+        else:
+            # No images left in the root directory
+            self.img_current   = None
+            self.current_index = -1
+            self.image_panel.set_image(None)
+            self.setWindowTitle('Viewfinder')
+
+
+    # ── Sort / move ────────────────────────────────────────────────────────────
+
+    def _show_sort_dialog(self):
+        """Open the Sort Destinations configuration dialog."""
+        dlg = SortDialog(self._sort_slots, self._sort_move, self)
+        if dlg.exec() == QDialog.Accepted:
+            self._sort_slots = dlg.get_slots()
+            self._sort_move  = dlg.get_move_mode()
+            save_sort_config(self._sort_slots, self._sort_move)
+
+
+    def _on_sort_key(self, key: str):
+        """Move or copy the current image to the folder assigned to *key*.
+
+        Silently ignored when:
+        - a QLineEdit / QAbstractSpinBox has focus (typing mode)
+        - no image is loaded
+        - the slot is not configured
+        """
+        from PySide6.QtWidgets import QLineEdit, QAbstractSpinBox
+        fw = self.focusWidget()
+        if isinstance(fw, (QLineEdit, QAbstractSpinBox)):
+            return
+
+        if self.img_current is None:
+            return
+
+        target_dir = self._sort_slots.get(key, '').strip()
+        if not target_dir:
+            return   # slot not configured — do nothing silently
+
+        if not (0 <= self.current_index < len(self.image_list)):
+            return
+        src_path = Path(self.image_list[self.current_index])
+
+        target_dir_path = Path(target_dir)
+        if not target_dir_path.is_dir():
+            ans = QMessageBox.question(
+                self, 'Create folder?',
+                f'Folder does not exist:\n{target_dir}\n\nCreate it?',
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans == QMessageBox.Yes:
+                try:
+                    target_dir_path.mkdir(parents=True, exist_ok=True)
+                except Exception as exc:
+                    QMessageBox.critical(self, 'Error', f'Could not create folder:\n{exc}')
+                    return
+            else:
+                return
+
+        dest_path = target_dir_path / src_path.name
+
+        # Handle name collision
+        if dest_path.exists():
+            ans = QMessageBox.question(
+                self, 'File already exists',
+                f'"{dest_path.name}" already exists in the target folder.\nOverwrite?',
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
+        action = 'move' if self._sort_move else 'copy'
+        try:
+            if self._sort_move:
+                shutil.move(str(src_path), str(dest_path))
+            else:
+                shutil.copy2(str(src_path), str(dest_path))
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error', f'Could not {action} file:\n{exc}')
+            return
+
+        if self._sort_move:
+            # Remove the image from the in-memory list
+            self.image_list.pop(self.current_index)
+
+            # Remove the image record from the face DB so stale paths
+            # don't appear on next analysis of this directory.
+            if self.faces_panel._cache is not None:
+                try:
+                    conn = self.faces_panel._cache._connect()
+                    conn.execute(
+                        'DELETE FROM images WHERE path = ?', (str(src_path),)
+                    )
+                    conn.commit()
+                except Exception:
+                    pass  # non-critical — DB cleanup failure doesn't block the UI
+
+            # Always reload the directory tree from the root that the user
+            # originally opened — never change to a sub-folder.
+            reload_dir = self._open_directory or str(src_path.parent)
+            self.dir_panel.load_directory(reload_dir)
+
+            if self.image_list:
+                next_idx = min(self.current_index, len(self.image_list) - 1)
+                self.current_index = next_idx - 1   # load_image_from_path will set it
+                self.load_image_from_path(self.image_list[next_idx])
+            else:
+                # No images left in the current directory
+                self.img_current   = None
+                self.current_index = -1
+                self.image_panel.set_image(None)
+                self.setWindowTitle('Viewfinder')
+        else:
+            # Copy — stay on current image, just advance to next
+            self._navigate(1)
+
+
+    # ── Directory-tree navigation ────────────────────────────────────────────
+
+    def _on_tree_file_selected(self, path: str):
+        """Double-click on an image file in the directory tree.
+
+        Sets the file's parent directory as the active navigation context
+        so that arrow-key navigation and sort-key shortcuts work within
+        the same folder, then opens the file.
+        """
+        parent = os.path.dirname(path)
+        self._activate_nav_dir(parent)
+        self.load_image_from_path(path)
+
+
+    def _on_tree_folder_selected(self, dir_path: str):
+        """Double-click on a directory in the directory tree.
+
+        Makes dir_path the active navigation directory: rebuilds image_list
+        from its direct contents and opens the first image (if any).
+        """
+        self._activate_nav_dir(dir_path)
+        if self.image_list:
+            self.load_image_from_path(self.image_list[0])
+
+
+    def _activate_nav_dir(self, dir_path: str):
+        """Set dir_path as the active navigation directory.
+
+        Rebuilds image_list from the direct contents of dir_path (non-recursive)
+        and resets the navigation index.  Does NOT change the directory-tree root
+        or the FS watcher root — those always stay at _open_directory.
+        """
+        self._nav_directory  = dir_path
+        self.image_list      = self.dir_panel.get_all_images(dir_path)
+        self.current_index   = -1          # will be set properly by load_image_from_path
+        self._filtered_paths = None        # clear any face-cluster filter
